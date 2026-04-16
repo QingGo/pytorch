@@ -291,9 +291,15 @@ class TestGpuWrapper(InductorTestCase):
         self.assertIn("static LazyTritonKernelState triton_", code)
         self.assertIn("ensureLazyTritonKernelReady(", code)
         self.assertIn("startKernelCompilesForModule(", code)
+        self.assertIn("launchLazyTritonKernel(", code)
+        self.assertIn("_source_path =", code)
         self.assertNotIn("_module_pending_kernels = PyDict_New()", code)
- 
+        self.assertNotIn("CUdeviceptr global_scratch_ptr = 0;", code)
+        self.assertNotIn("void* kernel_args_[] = {", code)
+        self.assertNotIn('R"TRITON(', code)
+
 instantiate_parametrized_tests(TestGpuWrapper)
+
 
 # Helper script for test_lazy_compile_kernel_name_collision_across_modules.
 # Run as a subprocess so dlopen truly re-runs .so static initializers.

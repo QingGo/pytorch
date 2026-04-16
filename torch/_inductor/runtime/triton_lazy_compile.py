@@ -97,7 +97,7 @@ def _wrap_tma_args(args: list[Any], kernel_fn: CachingAutotuner) -> list[Any]:
 
 
 def start_kernel_compile(
-    pending_kernels: dict[str, Any], kernel_name: str, kernel_source: str
+    pending_kernels: dict[str, Any], kernel_name: str, kernel_source_path: str
 ) -> None:
     """
     This function is called from C++ at model initialization time for each kernel.
@@ -112,9 +112,11 @@ def start_kernel_compile(
 
     async_compile = _get_async_compile()  # noqa: F841 (used by eval below)
 
-    # Evaluate the kernel source to get the Future or CachingAutotuner
-    # The kernel_source is like: async_compile.triton('name', '''...''', ...)
-    kernel_obj = eval(kernel_source.strip())
+    # Evaluate the persisted wrapper body to get the Future or CachingAutotuner.
+    # The file contents are like: async_compile.triton('name', '''...''', ...)
+    with open(kernel_source_path) as f:
+        kernel_source = f.read()
+    kernel_obj = eval(kernel_source.strip())  # noqa: S307
 
     pending_kernels[kernel_name] = kernel_obj
 

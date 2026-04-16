@@ -14,7 +14,7 @@
 
 struct LazyTritonKernelSpec {
   const char* kernel_name;
-  const char* kernel_source;
+  const char* kernel_source_path;
 };
 
 struct LazyTritonModuleState {
@@ -27,6 +27,13 @@ struct LazyTritonKernelState {
   bool ready = false;
 };
 
+struct LazyTritonScratchBuffers {
+  CUdeviceptr global_scratch = 0;
+  CUdeviceptr profile_scratch = 0;
+  RAIIAtenTensorHandle global_scratch_tensor;
+  RAIIAtenTensorHandle profile_scratch_tensor;
+};
+
 [[maybe_unused]] static inline CUfunction loadKernel(
     std::string filePath,
     const std::string& funcName,
@@ -37,6 +44,16 @@ struct LazyTritonKernelState {
     const void* start,
     const std::string& funcName,
     uint32_t sharedMemBytes);
+
+[[maybe_unused]] static inline void launchKernel(
+    CUfunction func,
+    uint32_t gridX,
+    uint32_t gridY,
+    uint32_t gridZ,
+    uint32_t numWarps,
+    uint32_t sharedMemBytes,
+    void* args[],
+    cudaStream_t stream);
 
 static PyObject* (*_THPVariable_Wrap)(const at::TensorBase&) = nullptr;
 static int32_t (*_THPUtils_unpackInt)(PyObject*) = nullptr;
@@ -215,15 +232,16 @@ static inline LazyKernelCompileResult runTritonKernelWithAutotune(
 static inline void startKernelCompile(
     PyObject* pending_kernels,
     const std::string& kernel_name,
-    const std::string& kernel_source) {
+    const std::string& kernel_source_path) {
   py::gil_scoped_acquire_simple acquire;
 
   RAIIPyObject py_name = PyUnicode_FromString(kernel_name.c_str());
-  RAIIPyObject py_source = PyUnicode_FromString(kernel_source.c_str());
-  AOTI_TORCH_CHECK(py_name && py_source, "Failed to create Python args");
+  RAIIPyObject py_source_path =
+      PyUnicode_FromString(kernel_source_path.c_str());
+  AOTI_TORCH_CHECK(py_name && py_source_path, "Failed to create Python args");
 
   RAIIPyObject call_args =
-      PyTuple_Pack(3, pending_kernels, py_name.get(), py_source.get());
+      PyTuple_Pack(3, pending_kernels, py_name.get(), py_source_path.get());
   AOTI_TORCH_CHECK(call_args, "Failed to create call args");
 
   RAIIPyObject result = PyObject_CallObject(start_kernel_compile, call_args);
@@ -240,8 +258,36 @@ static inline void startKernelCompilesForModule(
     const LazyTritonKernelSpec* kernel_spec = kernel_specs[i];
     AOTI_TORCH_CHECK(kernel_spec, "Invalid lazy Triton kernel spec");
     startKernelCompile(
-        pending_kernels, kernel_spec->kernel_name, kernel_spec->kernel_source);
+        pending_kernels,
+        kernel_spec->kernel_name,
+        kernel_spec->kernel_source_path);
   }
+}
+
+static inline void allocateLazyTritonScratchBuffer(
+    int64_t scratch_size,
+    int32_t device_idx,
+    CUdeviceptr* scratch_ptr,
+    RAIIAtenTensorHandle* scratch_tensor) {
+  AOTI_TORCH_CHECK(scratch_ptr, "Invalid lazy Triton scratch pointer");
+  AOTI_TORCH_CHECK(scratch_tensor, "Invalid lazy Triton scratch tensor");
+  if (scratch_size <= 0) {
+    return;
+  }
+
+  int64_t scratch_sizes[] = {scratch_size};
+  int64_t scratch_strides[] = {1};
+  AtenTensorHandle scratch_handle;
+  AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_empty_strided(
+      1,
+      scratch_sizes,
+      scratch_strides,
+      aoti_torch_dtype_uint8(),
+      aoti_torch_device_type_cuda(),
+      device_idx,
+      &scratch_handle));
+  *scratch_tensor = RAIIAtenTensorHandle(scratch_handle);
+  *scratch_ptr = reinterpret_cast<CUdeviceptr>(scratch_tensor->data_ptr());
 }
 
 template <typename... Args>
@@ -270,4 +316,43 @@ static inline bool ensureLazyTritonKernelReady(
       std::nullopt);
   kernel_state->ready = true;
   return true;
+}
+
+template <typename... Args>
+static inline void launchLazyTritonKernel(
+    const LazyTritonKernelState* kernel_state,
+    int32_t device_idx,
+    uint32_t grid_x,
+    uint32_t grid_y,
+    uint32_t grid_z,
+    cudaStream_t stream,
+    Args... kernel_args) {
+  AOTI_TORCH_CHECK(kernel_state, "Invalid lazy Triton kernel state");
+  AOTI_TORCH_CHECK(kernel_state->function, "Lazy Triton kernel is not loaded");
+
+  LazyTritonScratchBuffers scratch_buffers;
+  allocateLazyTritonScratchBuffer(
+      kernel_state->compile_result.global_scratch,
+      device_idx,
+      &scratch_buffers.global_scratch,
+      &scratch_buffers.global_scratch_tensor);
+  allocateLazyTritonScratchBuffer(
+      kernel_state->compile_result.profile_scratch,
+      device_idx,
+      &scratch_buffers.profile_scratch,
+      &scratch_buffers.profile_scratch_tensor);
+
+  void* launch_args[] = {
+      kernel_args...,
+      &scratch_buffers.global_scratch,
+      &scratch_buffers.profile_scratch};
+  launchKernel(
+      kernel_state->function,
+      grid_x,
+      grid_y,
+      grid_z,
+      kernel_state->compile_result.num_warps,
+      kernel_state->compile_result.shared_mem,
+      launch_args,
+      stream);
 }

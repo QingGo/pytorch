@@ -17,7 +17,7 @@ from torch._inductor.runtime.runtime_utils import dynamo_timed
 from torch.utils._ordered_set import OrderedSet
 
 from .. import config
-from ..codecache import CudaKernelParamCache
+from ..codecache import CudaKernelParamCache, write_text
 from ..ir import (
     GraphPartitionSignature,
     TensorBox,
@@ -386,44 +386,6 @@ class DeferredTritonCallWrapper:
                 )
         return call_args_str
 
-    def _generate_lazy_scratch(
-        self,
-        prefix: IndentedBuffer,
-        wrapper: CppWrapperGpu,
-        call_args_str: str,
-    ) -> str:
-        """Generate scratch space allocations with runtime-known sizes."""
-        kernel_name = self.kernel_name
-        kernel_result = f"{kernel_name}_state.compile_result"
-        dtype_str = wrapper.codegen_dtype(torch.uint8)
-        device_type, _ = wrapper.codegen_device(torch.device(get_gpu_type())).split(
-            ", "
-        )
-        device_ptr_type = wrapper.device_codegen.cpp_device_ptr()
-        for scratch_name in ("global_scratch", "profile_scratch"):
-            size_expr = f"{kernel_result}.{scratch_name}"
-            var = f"{scratch_name}_ptr"
-            prefix.splice(
-                maybe_hipify_code_wrapper(
-                    f"""\
-                {device_ptr_type} {var} = 0;
-                RAIIAtenTensorHandle {var}_tensor;
-                if ({size_expr} > 0) {{
-                    int64_t {var}_size[] = {{{size_expr}}};
-                    int64_t {var}_stride[] = {{1}};
-                    AtenTensorHandle {var}_handle;
-                    AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_empty_strided(
-                        1, {var}_size, {var}_stride, {dtype_str},
-                        {device_type}, device_idx_, &{var}_handle));
-                    {var}_tensor = RAIIAtenTensorHandle({var}_handle);
-                    {var} = reinterpret_cast<{device_ptr_type}>({var}_tensor.data_ptr());
-                }}
-            """
-                )
-            )
-            call_args_str += f", &{var}"
-        return call_args_str
-
     def _generate_lazy_launch(
         self,
         prefix: IndentedBuffer,
@@ -434,7 +396,6 @@ class DeferredTritonCallWrapper:
         """Generate kernel launch code for lazy-compiled kernels."""
         kernel_name = self.kernel_name
         kernel_state = f"{kernel_name}_state"
-        kernel_result = f"{kernel_state}.compile_result"
         signature = (self.triton_meta or {}).get("signature", {})
         tma_tensor_args = self.tma_tensor_args
         num_tma_tensor_args = len(tma_tensor_args)
@@ -470,22 +431,17 @@ class DeferredTritonCallWrapper:
         call_args_str = self._generate_lazy_tma_args(
             prefix, call_args_str, kernel_arg_names, tma_arg_names, signature
         )
-        call_args_str = self._generate_lazy_scratch(prefix, wrapper, call_args_str)
-
-        launch_args = (
-            f"{kernel_name}, grid_0, grid_1, grid_2,"
-            f" {kernel_name}_result.num_warps,"
-            f" {kernel_name}_result.shared_mem,"
-            f" kernel_args_, stream_"
-        )
-
-        prefix.splice(
-            f"""\
-            void* kernel_args_[] = {{{call_args_str}}};
-            launchKernel({kernel_state}.function, grid_0, grid_1, grid_2,
-                {kernel_result}.num_warps, {kernel_result}.shared_mem, kernel_args_, stream_);
-            """
-        )
+        launch_args = [
+            f"&{kernel_state}",
+            "device_idx_",
+            "grid_0",
+            "grid_1",
+            "grid_2",
+            "stream_",
+        ]
+        if call_args_str:
+            launch_args.append(call_args_str)
+        prefix.writeline(f"launchLazyTritonKernel({', '.join(launch_args)});")
 
     def generate_lazy(self, wrapper: CppWrapperGpu):
         """
@@ -506,14 +462,16 @@ class DeferredTritonCallWrapper:
         if tma_signature_types:
             wrapper.write_tma_descriptor_helpers_once()
 
-        # Use delimited raw string to handle )" in kernel source
         kernel_source_str = self.kernel_name_to_body.get(kernel_name, "")
-        kernel_body = f'R"TRITON(\n{kernel_source_str}\n)TRITON"'
-        prefix.writeline(f"static const char* {kernel_name}_source = {kernel_body};")
+        kernel_source_path = write_text(kernel_source_str)
+        prefix.writeline(
+            f"static const char* {kernel_name}_source_path = "
+            f"{cpp_string_literal(kernel_source_path)};"
+        )
         prefix.writeline(f"static LazyTritonKernelState {kernel_name}_state;")
         prefix.writeline(
             f"static const LazyTritonKernelSpec {kernel_name}_spec = "
-            f'{{"{kernel_name}", {kernel_name}_source}};'
+            f'{{"{kernel_name}", {kernel_name}_source_path}};'
         )
 
         wrapper_arg_names, kernel_arg_names = self._resolve_lazy_arg_names()
