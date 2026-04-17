@@ -907,6 +907,11 @@ class AllocateLine(MemoryPlanningLine):
         )
         from ..scheduler import NopKernelSchedulerNode
 
+        # The empty_strided lowering zeros the ComputedBuffer ranges to signal
+        # "no compute," which makes is_no_op() true and routes here via
+        # NopKernelSchedulerNode. This covers torch.empty / empty_like /
+        # empty_strided / empty_permuted. Used to trigger deterministic fill
+        # when torch.use_deterministic_algorithms is active.
         self.is_uninitialized = isinstance(
             V.graph.scheduler.current_node,
             NopKernelSchedulerNode,
