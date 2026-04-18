@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, TYPE_CHECKING
 
+from torch._dynamo.utils import dynamo_timed
 from torch._utils_internal import log_triton_builds
 
 
@@ -22,20 +23,26 @@ if TYPE_CHECKING:
 def _reload_python_module(
     key: str, path: str, set_sys_modules: bool = True
 ) -> ModuleType:
-    with open(path) as f:
+    with dynamo_timed("PyCodeCache.read_source"):
+        with open(path) as f:
+            source = f.read()
+
+    with dynamo_timed("PyCodeCache.compile_module"):
         try:
-            code = compile(f.read(), path, "exec", dont_inherit=True)
+            code = compile(source, path, "exec", dont_inherit=True)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to import {path}\n{type(e).__name__}: {e}"
             ) from None
-        mod = ModuleType(f"{__name__}.{key}")
-        mod.__file__ = path
-        mod.key = key  # type: ignore[attr-defined]
+
+    mod = ModuleType(f"{__name__}.{key}")
+    mod.__file__ = path
+    mod.key = key  # type: ignore[attr-defined]
+    with dynamo_timed("PyCodeCache.exec_module"):
         exec(code, mod.__dict__, mod.__dict__)
-        if set_sys_modules:
-            sys.modules[mod.__name__] = mod
-        return mod
+    if set_sys_modules:
+        sys.modules[mod.__name__] = mod
+    return mod
 
 
 @functools.cache

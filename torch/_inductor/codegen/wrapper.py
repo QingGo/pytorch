@@ -1489,7 +1489,7 @@ class PythonWrapperCodegen(CodeGen):
                 import torch
                 from math import inf, nan
                 from torch._dynamo.testing import rand_strided
-                from torch._dynamo.utils import preserve_rng_state
+                from torch._dynamo.utils import preserve_rng_state, dynamo_timed
                 from torch._inductor.select_algorithm import AlgorithmSelectorCache
                 from {async_compile.__name__} import AsyncCompile
 
@@ -2181,7 +2181,8 @@ class PythonWrapperCodegen(CodeGen):
         """
         self.kernel_autotune_defs.splice(
             """
-            async_compile.wait(globals())
+            with dynamo_timed("PythonWrapper.async_compile_wait"):
+                async_compile.wait(globals())
             del async_compile
         """
         )

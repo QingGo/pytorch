@@ -293,6 +293,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
             self._include_extra_header
         )
         self.codegen_int_array_var_cache = {}
+        self.needs_vec_isa = self.device == "cpu"
 
     @staticmethod
     def create(
@@ -475,6 +476,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
                 '''
                 import torch
                 from torch._inductor.codecache import CppWrapperCodeCache
+                from torch._inductor.runtime.runtime_utils import dynamo_timed
 
                 cpp_wrapper_src = (
                 r"""
@@ -1419,6 +1421,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
                 )
             return
         if cpp_definition is not None:
+            self.needs_vec_isa = True
             self.header.splice(cpp_definition)
             self.kernel_declarations.splice(f"\n{kernel_body}\n")
         else:
@@ -1538,16 +1541,25 @@ class CppWrapperCpu(PythonWrapperCodegen):
             result.splice('"""\n)')
 
         kernel_code = "kernel_src" if config.cpp_wrapper_build_separate else "None"
+        needs_vec_isa = (
+            "False" if config.cpp_wrapper_build_separate else str(self.needs_vec_isa)
+        )
+        kernel_needs_vec_isa = (
+            str(self.needs_vec_isa) if config.cpp_wrapper_build_separate else "None"
+        )
         # Cpp entry function for JIT with cpp wrapper
         result.splice(
             f"""
-            inductor_entry = CppWrapperCodeCache.load_pybinding(
-                argtypes=["std::vector<AtenTensorHandle>"],
-                main_code=cpp_wrapper_src,
-                device_type="{self.device}",
-                num_outputs={len(V.graph.graph_outputs)},
-                kernel_code={kernel_code},
-            )
+            with dynamo_timed("CppWrapper.load_pybinding"):
+                inductor_entry = CppWrapperCodeCache.load_pybinding(
+                    argtypes=["std::vector<AtenTensorHandle>"],
+                    main_code=cpp_wrapper_src,
+                    device_type="{self.device}",
+                    needs_vec_isa={needs_vec_isa},
+                    kernel_needs_vec_isa={kernel_needs_vec_isa},
+                    num_outputs={len(V.graph.graph_outputs)},
+                    kernel_code={kernel_code},
+                )
             """
         )
 

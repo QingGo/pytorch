@@ -274,6 +274,68 @@ class TestGpuWrapper(InductorTestCase):
         result = opt_fn(x, output_grad)
         self.assertEqual(result.shape, x.shape)
 
+    def test_cuda_cpp_wrapper_keeps_vec_isa_for_host_vectorized_code(self):
+        if not RUN_GPU:
+            self.skipTest("GPU not available")
+
+        def fn(x):
+            x = x + 1
+            x = x + 2
+            x = x.to(device=self.device)
+            x = x + 3
+            x = x + 4
+            x = x.cpu()
+            x = x + 5
+            x = x + 6
+            x = x.to(device=self.device)
+            x = x + 7
+            x = x + 8
+            x = x.cpu()
+            x = x + 9
+            x = x + 10
+            return x
+
+        x = torch.randn(2, 2, 10)
+        expected = fn(x)
+        compiled = torch.compile(options={"cpp_wrapper": True})(fn)
+        actual, code = test_torchinductor.run_and_get_cpp_code(compiled, x)
+
+        self.assertEqual(actual, expected)
+        self.assertIn("at::vec::", code)
+        self.assertIn("needs_vec_isa=True", code)
+
+    def test_cuda_cpp_wrapper_build_separate_splits_vec_isa_requirements(self):
+        if not RUN_GPU:
+            self.skipTest("GPU not available")
+
+        def fn(x):
+            x = x + 1
+            x = x + 2
+            x = x.to(device=self.device)
+            x = x + 3
+            x = x + 4
+            x = x.cpu()
+            x = x + 5
+            x = x + 6
+            x = x.to(device=self.device)
+            x = x + 7
+            x = x + 8
+            x = x.cpu()
+            x = x + 9
+            x = x + 10
+            return x
+
+        x = torch.randn(2, 2, 10)
+        expected = fn(x)
+        with config.patch({"cpp_wrapper_build_separate": True}):
+            compiled = torch.compile(options={"cpp_wrapper": True})(fn)
+            actual, code = test_torchinductor.run_and_get_cpp_code(compiled, x)
+
+        self.assertEqual(actual, expected)
+        self.assertIn("kernel_src = (", code)
+        self.assertIn("needs_vec_isa=False", code)
+        self.assertIn("kernel_needs_vec_isa=True", code)
+
     def test_lazy_compile_codegen_uses_shared_runtime_state(self):
         if not RUN_GPU:
             self.skipTest("GPU not available")
@@ -293,6 +355,7 @@ class TestGpuWrapper(InductorTestCase):
         self.assertIn("startKernelCompilesForModule(", code)
         self.assertIn("launchLazyTritonKernel(", code)
         self.assertIn("_source_path =", code)
+        self.assertIn("needs_vec_isa=False", code)
         self.assertNotIn("_module_pending_kernels = PyDict_New()", code)
         self.assertNotIn("CUdeviceptr global_scratch_ptr = 0;", code)
         self.assertNotIn("void* kernel_args_[] = {", code)
