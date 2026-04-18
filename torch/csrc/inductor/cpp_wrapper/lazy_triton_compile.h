@@ -12,6 +12,32 @@
 #include <torch/csrc/inductor/cpp_wrapper/device_internal/cuda.h>
 #endif
 
+struct LazyTritonKernelSpec {
+  const char* kernel_name;
+  const char* kernel_source;
+};
+
+struct LazyTritonModuleState {
+  PyObject* pending_kernels = nullptr;
+};
+
+struct LazyTritonKernelState {
+  CUfunction function = nullptr;
+  LazyKernelCompileResult compile_result;
+  bool ready = false;
+};
+
+[[maybe_unused]] static inline CUfunction loadKernel(
+    std::string filePath,
+    const std::string& funcName,
+    uint32_t sharedMemBytes,
+    const std::optional<std::string>& cubinDir);
+
+[[maybe_unused]] static inline CUfunction loadKernel(
+    const void* start,
+    const std::string& funcName,
+    uint32_t sharedMemBytes);
+
 static PyObject* (*_THPVariable_Wrap)(const at::TensorBase&) = nullptr;
 static int32_t (*_THPUtils_unpackInt)(PyObject*) = nullptr;
 
@@ -19,11 +45,6 @@ static int32_t (*_THPUtils_unpackInt)(PyObject*) = nullptr;
 static PyObject* triton_lazy_compile_module = nullptr;
 static PyObject* start_kernel_compile = nullptr;
 static PyObject* run_triton_kernel_with_autotune = nullptr;
-
-// Per-module dict for pending kernel compile results (avoids global state
-// collisions when multiple compiled modules produce kernels with the same
-// name).
-static PyObject* _module_pending_kernels = nullptr;
 
 static inline void loadLazyCompileFuncs() {
   if (triton_lazy_compile_module == nullptr) {
@@ -62,6 +83,17 @@ static inline void loadLazyCompileFuncs() {
         PyLong_AsVoidPtr(unpack_addr));
     AOTI_TORCH_CHECK(_THPUtils_unpackInt, "THPUtils_unpackInt not resolved");
   }
+}
+
+static inline PyObject* getPendingKernelsForModule(
+    LazyTritonModuleState* module_state) {
+  AOTI_TORCH_CHECK(module_state, "Invalid lazy Triton module state");
+  if (module_state->pending_kernels == nullptr) {
+    module_state->pending_kernels = PyDict_New();
+    AOTI_TORCH_CHECK(
+        module_state->pending_kernels, "Failed to create pending kernels dict");
+  }
+  return module_state->pending_kernels;
 }
 
 static inline std::string getStringAttr(PyObject* obj, const char* attr) {
@@ -196,4 +228,46 @@ static inline void startKernelCompile(
 
   RAIIPyObject result = PyObject_CallObject(start_kernel_compile, call_args);
   AOTI_TORCH_CHECK(result, "Failed to start kernel compilation");
+}
+
+static inline void startKernelCompilesForModule(
+    LazyTritonModuleState* module_state,
+    const LazyTritonKernelSpec* const* kernel_specs,
+    size_t num_kernel_specs) {
+  loadLazyCompileFuncs();
+  PyObject* pending_kernels = getPendingKernelsForModule(module_state);
+  for (size_t i = 0; i < num_kernel_specs; ++i) {
+    const LazyTritonKernelSpec* kernel_spec = kernel_specs[i];
+    AOTI_TORCH_CHECK(kernel_spec, "Invalid lazy Triton kernel spec");
+    startKernelCompile(
+        pending_kernels, kernel_spec->kernel_name, kernel_spec->kernel_source);
+  }
+}
+
+template <typename... Args>
+static inline bool ensureLazyTritonKernelReady(
+    LazyTritonModuleState* module_state,
+    const LazyTritonKernelSpec* kernel_spec,
+    LazyTritonKernelState* kernel_state,
+    cudaStream_t stream,
+    const Args&... kernel_args) {
+  AOTI_TORCH_CHECK(kernel_spec, "Invalid lazy Triton kernel spec");
+  AOTI_TORCH_CHECK(kernel_state, "Invalid lazy Triton kernel state");
+
+  if (kernel_state->ready) {
+    return false;
+  }
+
+  kernel_state->compile_result = runTritonKernelWithAutotune(
+      getPendingKernelsForModule(module_state),
+      kernel_spec->kernel_name,
+      stream,
+      kernel_args...);
+  kernel_state->function = loadKernel(
+      kernel_state->compile_result.cubin_path,
+      kernel_state->compile_result.mangled_name,
+      kernel_state->compile_result.shared_mem,
+      std::nullopt);
+  kernel_state->ready = true;
+  return true;
 }

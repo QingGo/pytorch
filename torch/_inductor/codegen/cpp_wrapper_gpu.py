@@ -317,6 +317,8 @@ class DeferredTritonCallWrapper:
     def _generate_lazy_grid(self, prefix: IndentedBuffer) -> None:
         """Generate grid computation code for lazy-compiled kernels."""
         kernel_name = self.kernel_name
+        kernel_state = f"{kernel_name}_state"
+        kernel_result = f"{kernel_state}.compile_result"
         grid_type = self.inductor_meta.get("grid_type") if self.inductor_meta else None
 
         # For PrecomputedGrid, generate switch statement on config_index
@@ -344,7 +346,7 @@ class DeferredTritonCallWrapper:
             prefix.splice(
                 f"""\
                 uint32_t grid_0, grid_1, grid_2;
-                switch ({kernel_name}_result.config_index) {{
+                switch ({kernel_result}.config_index) {{
                     {switch_body}
                 }}
                 if (grid_0 == 0) return;
@@ -353,7 +355,7 @@ class DeferredTritonCallWrapper:
         else:
             from ..runtime.triton_heuristics import GridExpr
 
-            grid = GridExpr.from_meta_lazy(self.inductor_meta, kernel_name)
+            grid = GridExpr.from_meta_lazy(self.inductor_meta, kernel_result)
             for line in grid.prefix:
                 prefix.writeline(line)
 
@@ -392,13 +394,14 @@ class DeferredTritonCallWrapper:
     ) -> str:
         """Generate scratch space allocations with runtime-known sizes."""
         kernel_name = self.kernel_name
+        kernel_result = f"{kernel_name}_state.compile_result"
         dtype_str = wrapper.codegen_dtype(torch.uint8)
         device_type, _ = wrapper.codegen_device(torch.device(get_gpu_type())).split(
             ", "
         )
         device_ptr_type = wrapper.device_codegen.cpp_device_ptr()
         for scratch_name in ("global_scratch", "profile_scratch"):
-            size_expr = f"{kernel_name}_result.{scratch_name}"
+            size_expr = f"{kernel_result}.{scratch_name}"
             var = f"{scratch_name}_ptr"
             prefix.splice(
                 maybe_hipify_code_wrapper(
@@ -430,6 +433,8 @@ class DeferredTritonCallWrapper:
     ) -> None:
         """Generate kernel launch code for lazy-compiled kernels."""
         kernel_name = self.kernel_name
+        kernel_state = f"{kernel_name}_state"
+        kernel_result = f"{kernel_state}.compile_result"
         signature = (self.triton_meta or {}).get("signature", {})
         tma_tensor_args = self.tma_tensor_args
         num_tma_tensor_args = len(tma_tensor_args)
@@ -477,7 +482,8 @@ class DeferredTritonCallWrapper:
         prefix.splice(
             f"""\
             void* kernel_args_[] = {{{call_args_str}}};
-            launchKernel({launch_args});
+            launchKernel({kernel_state}.function, grid_0, grid_1, grid_2,
+                {kernel_result}.num_warps, {kernel_result}.shared_mem, kernel_args_, stream_);
             """
         )
 
@@ -489,21 +495,26 @@ class DeferredTritonCallWrapper:
         kernel_name = self.kernel_name
         # Track kernel names for parallel initialization
         wrapper._lazy_kernel_names.append(kernel_name)
+        if not wrapper._lazy_module_state_emitted:
+            prefix.writeline(
+                "static LazyTritonModuleState _triton_kernel_module_state;"
+            )
+            wrapper._lazy_module_state_emitted = True
 
         # Include TMA helpers if any args use TMA descriptors
         tma_signature_types = self._get_tma_args()
         if tma_signature_types:
             wrapper.write_tma_descriptor_helpers_once()
 
-        kernel_var_decl = maybe_hipify_code_wrapper(
-            f"static {wrapper.device_codegen.cpp_kernel_type()} {kernel_name} = nullptr;"
-        )
-        prefix.writeline(kernel_var_decl)
         # Use delimited raw string to handle )" in kernel source
         kernel_source_str = self.kernel_name_to_body.get(kernel_name, "")
         kernel_body = f'R"TRITON(\n{kernel_source_str}\n)TRITON"'
         prefix.writeline(f"static const char* {kernel_name}_source = {kernel_body};")
-        prefix.writeline(f"static LazyKernelCompileResult {kernel_name}_result;")
+        prefix.writeline(f"static LazyTritonKernelState {kernel_name}_state;")
+        prefix.writeline(
+            f"static const LazyTritonKernelSpec {kernel_name}_spec = "
+            f'{{"{kernel_name}", {kernel_name}_source}};'
+        )
 
         wrapper_arg_names, kernel_arg_names = self._resolve_lazy_arg_names()
         signature = (self.triton_meta or {}).get("signature", {})
@@ -531,28 +542,31 @@ class DeferredTritonCallWrapper:
             else:
                 autotune_arg_list.append(name)
         autotune_args = ", ".join(autotune_arg_list)
+        for tensor_name, scalar_var, dtype in scalar_extractions:
+            wrapper.codegen_tensor_item(
+                dtype, tensor_name, scalar_var, indented_buffer=prefix
+            )
         # Lazy compile with autotuning on first invocation
         with prefix.indent():
-            prefix.writeline(f"if ({kernel_name} == nullptr) {{")
+            prefix.writeline("if (ensureLazyTritonKernelReady(")
             with prefix.indent():
-                for tensor_name, scalar_var, dtype in scalar_extractions:
-                    wrapper.codegen_tensor_item(
-                        dtype, tensor_name, scalar_var, indented_buffer=prefix
-                    )
-                prefix.splice(
-                    f"""\
-                    {kernel_name}_result = runTritonKernelWithAutotune(
-                        _module_pending_kernels, "{kernel_name}", stream_, {autotune_args});
-
-                    {kernel_name} = loadKernel(
-                        {kernel_name}_result.cubin_path,
-                        {kernel_name}_result.mangled_name,
-                        {kernel_name}_result.shared_mem);
-
-                    // First invocation already ran the kernel, so return early
-                    return;
-                    """
+                ensure_args = [
+                    "&_triton_kernel_module_state",
+                    f"&{kernel_name}_spec",
+                    f"&{kernel_name}_state",
+                    "stream_",
+                ]
+                if autotune_args:
+                    ensure_args.append(autotune_args)
+                for i, arg in enumerate(ensure_args):
+                    comma = "," if i < len(ensure_args) - 1 else ""
+                    prefix.writeline(f"{arg}{comma}")
+            prefix.writeline(")) {")
+            with prefix.indent():
+                prefix.writeline(
+                    "// First invocation already ran the kernel, so return early"
                 )
+                prefix.writeline("return;")
             prefix.writeline("}")
 
             self._generate_lazy_grid(prefix)
@@ -815,6 +829,7 @@ class CppWrapperGpu(CppWrapperCpu):
         self._triton_call_wrappers: dict[str, DeferredTritonCallWrapper] = {}
         self.autotune_input_prefix = "_REAL_AUTOTUNE_INPUT"
         self._lazy_kernel_names: list[str] = []
+        self._lazy_module_state_emitted = False
 
     @staticmethod
     def create(
@@ -833,9 +848,9 @@ class CppWrapperGpu(CppWrapperCpu):
             return
 
         super().write_header()
-        self.header.splice(
-            maybe_hipify_code_wrapper(self.device_codegen.kernel_driver())
-        )
+        kernel_driver = maybe_hipify_code_wrapper(self.device_codegen.kernel_driver())
+        if kernel_driver.strip():
+            self.header.splice(kernel_driver)
 
     @cache_on_self
     def write_tma_descriptor_helpers_once(self):
@@ -933,18 +948,20 @@ class CppWrapperGpu(CppWrapperCpu):
 
         # Generate parallel kernel compilation initialization function
         if self._lazy_kernel_names:
-            start_compile_calls = "\n    ".join(
-                f'startKernelCompile(_module_pending_kernels, "{name}", {name}_source);'
-                for name in self._lazy_kernel_names
+            kernel_specs = "\n    ".join(
+                f"&{name}_spec," for name in self._lazy_kernel_names
             )
             self.prefix.splice(
                 f"""\
 // Start parallel compilation of all Triton kernels
 static inline void start_all_triton_kernel_compiles() {{
-    loadLazyCompileFuncs();
-    _module_pending_kernels = PyDict_New();
-    AOTI_TORCH_CHECK(_module_pending_kernels, "Failed to create pending kernels dict");
-    {start_compile_calls}
+    static const LazyTritonKernelSpec* kernel_specs[] = {{
+    {kernel_specs}
+    }};
+    startKernelCompilesForModule(
+        &_triton_kernel_module_state,
+        kernel_specs,
+        sizeof(kernel_specs) / sizeof(kernel_specs[0]));
 }}
 
 // Static initializer to start kernel compilation on module load

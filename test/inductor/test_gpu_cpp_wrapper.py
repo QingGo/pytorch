@@ -274,7 +274,25 @@ class TestGpuWrapper(InductorTestCase):
         result = opt_fn(x, output_grad)
         self.assertEqual(result.shape, x.shape)
 
+    def test_lazy_compile_codegen_uses_shared_runtime_state(self):
+        if not RUN_GPU:
+            self.skipTest("GPU not available")
 
+        def fn(x, y):
+            return (x.sin() + y).cos()
+
+        x = torch.randn(128, device=self.device)
+        y = torch.randn(128, device=self.device)
+        with config.patch({"triton.autotune_at_compile_time": False}):
+            compiled = torch.compile(options={"cpp_wrapper": True})(fn)
+            _, code = test_torchinductor.run_and_get_cpp_code(compiled, x, y)
+
+        self.assertIn("static LazyTritonModuleState _triton_kernel_module_state;", code)
+        self.assertIn("static LazyTritonKernelState triton_", code)
+        self.assertIn("ensureLazyTritonKernelReady(", code)
+        self.assertIn("startKernelCompilesForModule(", code)
+        self.assertNotIn("_module_pending_kernels = PyDict_New()", code)
+ 
 instantiate_parametrized_tests(TestGpuWrapper)
 
 # Helper script for test_lazy_compile_kernel_name_collision_across_modules.
