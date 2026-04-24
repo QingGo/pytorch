@@ -3294,6 +3294,8 @@ def custom_op_wrapper(op: str, *args: Any) -> list[c_void_p] | c_void_p | None:
 # because these headers need to be global, rather than ignored by fresh_cache.
 _HEADER_DIR = os.path.join(default_cache_dir(), "precompiled_headers")
 _HEADER_LOCK_DIR = os.path.join(_HEADER_DIR, "locks")
+_CPP_WRAPPER_HOST_DIR = os.path.join(default_cache_dir(), "cpp_wrapper_host")
+_CPP_WRAPPER_HOST_LOCK_DIR = os.path.join(_CPP_WRAPPER_HOST_DIR, "locks")
 _VEC_ISA_CPP_SOURCE_MARKERS = ("at::vec::", "prod_masked_reduce(")
 
 
@@ -3401,6 +3403,23 @@ def _resolve_needs_vec_isa(
     if base_device_type == "cpu":
         return True
     return any(marker in source for marker in _VEC_ISA_CPP_SOURCE_MARKERS)
+
+
+def _portable_cpp_wrapper_host_dir(
+    key: str,
+    base_device_type: str,
+    main_code: str,
+    optimized_code: str | None,
+    enabled: bool,
+) -> str:
+    if not enabled or base_device_type == "cpu" or optimized_code is not None:
+        return ""
+
+    active_cache_dir = cache_dir()
+    if active_cache_dir in main_code:
+        return ""
+
+    return os.path.join(_CPP_WRAPPER_HOST_DIR, key[1:3])
 
 
 @clear_on_fresh_cache
@@ -3522,10 +3541,23 @@ class CppCodeCache:
 
         main_cmd_line = get_hashable_command_line(main_build_option)
         optimized_cmd_line = get_hashable_command_line(optimized_build_option)
+        main_extra = f"{optimized_code} {main_cmd_line}"
+        key = get_hash(main_code.strip(), main_extra)
+        portable_artifact_dir = _portable_cpp_wrapper_host_dir(
+            key,
+            base_device_type,
+            main_code,
+            optimized_code,
+            getattr(cls, "_use_global_cpp_wrapper_host_cache", False),
+        )
 
         with dynamo_timed("CppCodeCache.write_main_source"):
             key, main_path = write(
-                main_code, "main.cpp", extra=f"{optimized_code} {main_cmd_line}"
+                main_code,
+                "main.cpp",
+                extra=main_extra,
+                specified_dir=portable_artifact_dir,
+                key=key,
             )
 
         # Don't bother writing if the argument is empty.
@@ -3541,7 +3573,11 @@ class CppCodeCache:
         if key not in cls.cache:
             from torch.utils._filelock import FileLock
 
-            lock_path = os.path.join(get_lock_dir(), key + ".lock")
+            if portable_artifact_dir:
+                os.makedirs(_CPP_WRAPPER_HOST_LOCK_DIR, exist_ok=True)
+                lock_path = os.path.join(_CPP_WRAPPER_HOST_LOCK_DIR, key + ".lock")
+            else:
+                lock_path = os.path.join(get_lock_dir(), key + ".lock")
             future: Future[Any] | None = None
             lib = None
 
@@ -3868,6 +3904,7 @@ class CppPythonBindingsCodeCache(CppCodeCache):
 @clear_on_fresh_cache
 class CppWrapperCodeCache(CppPythonBindingsCodeCache):
     cache: dict[str, Callable[[], CDLL | ModuleType]] = {}
+    _use_global_cpp_wrapper_host_cache = True
 
     @staticmethod
     def cache_clear() -> None:

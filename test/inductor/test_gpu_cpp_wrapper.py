@@ -406,11 +406,23 @@ _LAZY_COMPILE_REPEATED_TEMP_CACHE_SCRIPT = """\
 import tempfile
 
 import torch
+from torch._inductor import codecache
 from torch._inductor import config
 from torch._inductor.runtime.cache_dir_utils import temporary_cache_dir
 from torch.testing._internal.inductor_utils import GPU_TYPE
 
 config.triton.autotune_at_compile_time = False
+
+wrapper_builds = 0
+orig_build = codecache.CppBuilder.build
+
+def counting_build(self):
+    global wrapper_builds
+    if self.get_target_file_path().endswith(".main.so"):
+        wrapper_builds += 1
+    return orig_build(self)
+
+codecache.CppBuilder.build = counting_build
 
 def fn(a, b, c):
     return torch.mm(a, b) + torch.relu(torch.sin(c) + 1)
@@ -425,6 +437,8 @@ for _ in range(2):
             expected = fn(a, b, c)
             actual = torch.compile(fn, options={"cpp_wrapper": True})(a, b, c)
             torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+assert wrapper_builds <= 1, f"Expected at most one wrapper build, got {wrapper_builds}"
 """
 
 
