@@ -45,6 +45,10 @@ class TritonKernelCompileResult:
 _async_compile: Any = None
 
 
+def _pending_kernel_key(kernel_name: str, kernel_source_key: str) -> str:
+    return f"{kernel_name}:{kernel_source_key}"
+
+
 def _get_async_compile() -> Any:
     """Get or create the shared AsyncCompile instance."""
     global _async_compile
@@ -117,7 +121,8 @@ def start_kernel_compile(
     The pending_kernels dict is per-module, created in C++ and passed through
     to avoid global state collisions across compiled modules.
     """
-    if kernel_name in pending_kernels:
+    pending_key = _pending_kernel_key(kernel_name, kernel_source_key)
+    if pending_key in pending_kernels:
         return
 
     async_compile = _get_async_compile()  # noqa: F841 (used by eval below)
@@ -129,12 +134,13 @@ def start_kernel_compile(
         kernel_source = f.read()
     kernel_obj = eval(kernel_source.strip())  # noqa: S307
 
-    pending_kernels[kernel_name] = kernel_obj
+    pending_kernels[pending_key] = kernel_obj
 
 
 def run_triton_kernel_with_autotune(
     pending_kernels: dict[str, Any],
     kernel_name: str,
+    kernel_source_key: str,
     stream: Any,
     args: list[Any],
 ) -> TritonKernelCompileResult:
@@ -144,9 +150,13 @@ def run_triton_kernel_with_autotune(
     from torch._inductor.codecache import CodeCacheFuture, CudaKernelParamCache
     from torch._inductor.runtime.triton_heuristics import config_to_dict
 
-    if kernel_name not in pending_kernels:
-        raise RuntimeError(f"Kernel {kernel_name} not found in pending kernels.")
-    kernel_obj = pending_kernels[kernel_name]
+    pending_key = _pending_kernel_key(kernel_name, kernel_source_key)
+    if pending_key not in pending_kernels:
+        raise RuntimeError(
+            f"Kernel {kernel_name} with source key {kernel_source_key} "
+            "not found in pending kernels."
+        )
+    kernel_obj = pending_kernels[pending_key]
 
     if isinstance(kernel_obj, CodeCacheFuture):
         kernel_fn = kernel_obj.result()

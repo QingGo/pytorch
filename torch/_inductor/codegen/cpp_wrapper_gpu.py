@@ -910,17 +910,15 @@ class CppWrapperGpu(CppWrapperCpu):
             )
             self.prefix.splice(
                 f"""\
-static struct TritonKernelCompileInit {{
-    TritonKernelCompileInit() {{
-        static const LazyTritonKernelSpec* kernel_specs[] = {{
+static inline void startLazyTritonKernelCompiles() {{
+    static const LazyTritonKernelSpec* kernel_specs[] = {{
         {kernel_specs}
-        }};
-        startKernelCompilesForModule(
-            &_triton_kernel_module_state,
-            kernel_specs,
-            sizeof(kernel_specs) / sizeof(kernel_specs[0]));
-    }}
-}} __triton_kernel_compile_init;
+    }};
+    startKernelCompilesForModule(
+        &_triton_kernel_module_state,
+        kernel_specs,
+        sizeof(kernel_specs) / sizeof(kernel_specs[0]));
+}}
 """
             )
 

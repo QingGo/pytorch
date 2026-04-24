@@ -165,8 +165,10 @@ class TestGpuWrapper(InductorTestCase):
         captured = {}
         original = tlc.run_triton_kernel_with_autotune
 
-        def capture(pending_kernels, kernel_name, stream, args):
-            result = original(pending_kernels, kernel_name, stream, args)
+        def capture(pending_kernels, kernel_name, kernel_source_key, stream, args):
+            result = original(
+                pending_kernels, kernel_name, kernel_source_key, stream, args
+            )
             if "triton_for_fused" in kernel_name:
                 captured[kernel_name] = result.xblocks
             return result
@@ -361,6 +363,22 @@ class TestGpuWrapper(InductorTestCase):
         self.assertNotIn("CUdeviceptr global_scratch_ptr = 0;", code)
         self.assertNotIn("void* kernel_args_[] = {", code)
         self.assertNotIn('R"TRITON(', code)
+
+    def test_lazy_compile_source_key_disambiguates_dtype_recompile(self):
+        if GPU_TYPE != "cuda" or torch.version.hip:
+            self.skipTest("CUDA-only lazy Triton runtime test")
+
+        def fn(a, b):
+            return (torch.relu(a), torch.relu(a + b) / 10)
+
+        with config.patch(
+            {"cpp_wrapper": True, "triton.autotune_at_compile_time": False}
+        ):
+            test_torchinductor.check_model_gpu(
+                self,
+                fn,
+                (torch.randn(8, 8), torch.randn(8, 8)),
+            )
 
 
 instantiate_parametrized_tests(TestGpuWrapper)

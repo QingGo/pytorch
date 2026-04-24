@@ -3776,6 +3776,7 @@ class CppPythonBindingsCodeCache(CppCodeCache):
 
         static PyMethodDef py_methods[] = {{
             {{"{entry_func}", {entry_func}_py, METH_VARARGS, ""}},
+            {extra_py_methods}
             {{NULL, NULL, 0, NULL}}}};
 
         static struct PyModuleDef py_module =
@@ -3808,6 +3809,7 @@ class CppPythonBindingsCodeCache(CppCodeCache):
         }}
         """
     )
+    extra_py_methods = ""
 
     @classmethod
     # pyrefly: ignore [bad-override]
@@ -3845,6 +3847,9 @@ class CppPythonBindingsCodeCache(CppCodeCache):
         submit_fn: Any = None,
         extra_flags: Sequence[str] = (),
         kernel_code: str | None = None,
+        extra_parse_arg: str | None = None,
+        extra_py_methods: str = "",
+        post_load_method: str | None = None,
     ) -> Any:
         """
         Wrap a C++ function in fast Python bindings.
@@ -3874,7 +3879,10 @@ class CppPythonBindingsCodeCache(CppCodeCache):
             arg_len=len(argtypes),
             call_entry_func=cls.call_entry_function.format(parseargs),
             entry_func=cls.entry_function,
-            extra_parse_arg=cls.extra_parse_arg.format(array_len=num_outputs),
+            extra_parse_arg=(
+                cls.extra_parse_arg if extra_parse_arg is None else extra_parse_arg
+            ).format(array_len=num_outputs),
+            extra_py_methods=extra_py_methods or cls.extra_py_methods,
         )
         get_result = cls.load_async(
             main_code + suffix,
@@ -3892,6 +3900,8 @@ class CppPythonBindingsCodeCache(CppCodeCache):
             if result is None:
                 result = get_result()
                 assert isinstance(result, ModuleType)
+                if post_load_method is not None:
+                    getattr(result, post_load_method)()
             return getattr(result, cls.entry_function)
 
         return future
@@ -3903,6 +3913,8 @@ class CppPythonBindingsCodeCache(CppCodeCache):
 
 @clear_on_fresh_cache
 class CppWrapperCodeCache(CppPythonBindingsCodeCache):
+    """Compile and load C++ wrapper Python extension modules."""
+
     cache: dict[str, Callable[[], CDLL | ModuleType]] = {}
     _use_global_cpp_wrapper_host_cache = True
 
@@ -3916,6 +3928,26 @@ class CppWrapperCodeCache(CppPythonBindingsCodeCache):
     }
     entry_function = "inductor_entry_cpp"
     call_entry_function = "return inductor_entry_cpp({});"
+    lazy_compile_start_method = "start_inductor_entry_cpp"
+    lazy_compile_extra_parse_arg = textwrap.dedent(
+        """
+        static PyObject* start_inductor_entry_cpp_py(PyObject* self, PyObject* args) {{
+            try {{
+                startLazyTritonKernelCompiles();
+                Py_RETURN_NONE;
+            }} catch(std::exception const& e) {{
+                PyErr_SetString(PyExc_RuntimeError, e.what());
+                return nullptr;
+            }} catch(...) {{
+                PyErr_SetString(PyExc_RuntimeError, "unhandled error");
+                return nullptr;
+            }}
+        }}
+        """
+    )
+    lazy_compile_extra_py_methods = (
+        '{"start_inductor_entry_cpp", start_inductor_entry_cpp_py, METH_NOARGS, ""},'
+    )
     extra_parse_arg = textwrap.dedent(
         """
         #include <torch/csrc/inductor/aoti_torch/c/shim.h>
@@ -3969,6 +4001,21 @@ class CppWrapperCodeCache(CppPythonBindingsCodeCache):
         }}
         """
     )
+
+    @classmethod
+    def load_pybinding_async(  # type: ignore[override]
+        cls,
+        *args: Any,
+        start_lazy_compile: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        if start_lazy_compile:
+            kwargs["extra_parse_arg"] = (
+                cls.extra_parse_arg + cls.lazy_compile_extra_parse_arg
+            )
+            kwargs["extra_py_methods"] = cls.lazy_compile_extra_py_methods
+            kwargs["post_load_method"] = cls.lazy_compile_start_method
+        return super().load_pybinding_async(*args, **kwargs)
 
     @classmethod
     def _get_uncompiled_header(cls, device: str) -> str | None:
