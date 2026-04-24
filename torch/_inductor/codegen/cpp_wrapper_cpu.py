@@ -1540,13 +1540,18 @@ class CppWrapperCpu(PythonWrapperCodegen):
             # Close the wrapper code block
             result.splice('"""\n)')
 
-        kernel_code = "kernel_src" if config.cpp_wrapper_build_separate else "None"
-        needs_vec_isa = (
-            "False" if config.cpp_wrapper_build_separate else str(self.needs_vec_isa)
-        )
-        kernel_needs_vec_isa = (
-            str(self.needs_vec_isa) if config.cpp_wrapper_build_separate else "None"
-        )
+        # When building the wrapper and kernel as separate TUs, only the kernel
+        # library can require CPU vectorized helpers; the wrapper itself never
+        # does. In the single-TU path, the wrapper carries any vec-ISA usage
+        # and the separate kernel param is unused.
+        if config.cpp_wrapper_build_separate:
+            kernel_code = "kernel_src"
+            needs_vec_isa = "False"
+            kernel_needs_vec_isa = str(self.needs_vec_isa)
+        else:
+            kernel_code = "None"
+            needs_vec_isa = str(self.needs_vec_isa)
+            kernel_needs_vec_isa = "None"
         # Cpp entry function for JIT with cpp wrapper
         result.splice(
             f"""

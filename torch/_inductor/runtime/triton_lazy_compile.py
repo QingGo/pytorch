@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import re
 from typing import Any
 
@@ -52,6 +53,15 @@ def _get_async_compile() -> Any:
 
         _async_compile = AsyncCompile()
     return _async_compile
+
+
+def _resolve_kernel_source_path(kernel_source_key: str) -> str:
+    if os.path.isabs(kernel_source_key) or os.sep in kernel_source_key:
+        return kernel_source_key
+
+    from torch._inductor.codecache import get_path
+
+    return get_path(kernel_source_key, "txt")[2]
 
 
 def _wrap_tma_args(args: list[Any], kernel_fn: CachingAutotuner) -> list[Any]:
@@ -97,7 +107,7 @@ def _wrap_tma_args(args: list[Any], kernel_fn: CachingAutotuner) -> list[Any]:
 
 
 def start_kernel_compile(
-    pending_kernels: dict[str, Any], kernel_name: str, kernel_source_path: str
+    pending_kernels: dict[str, Any], kernel_name: str, kernel_source_key: str
 ) -> None:
     """
     This function is called from C++ at model initialization time for each kernel.
@@ -114,6 +124,7 @@ def start_kernel_compile(
 
     # Evaluate the persisted wrapper body to get the Future or CachingAutotuner.
     # The file contents are like: async_compile.triton('name', '''...''', ...)
+    kernel_source_path = _resolve_kernel_source_path(kernel_source_key)
     with open(kernel_source_path) as f:
         kernel_source = f.read()
     kernel_obj = eval(kernel_source.strip())  # noqa: S307

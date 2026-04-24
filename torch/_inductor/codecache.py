@@ -3357,7 +3357,7 @@ def _precompile_header(
     # _worker_compile_cpp will automatically ignore any compilation whose result already
     # exists, so this is always safe.
     os.makedirs(_HEADER_LOCK_DIR, exist_ok=True)
-    _worker_compile_cpp_with_timing(
+    _worker_compile_cpp(
         os.path.join(_HEADER_LOCK_DIR, f"{header_hash}.lock"),
         ((f"{phase_name}.compile", cpp_builder),),
     )
@@ -3383,23 +3383,24 @@ def _get_cpp_wrapper_header(device: str, aot_mode: bool = False) -> str:
     )
 
 
-def _source_uses_vec_isa(*sources: str | None) -> bool:
-    for source in sources:
-        if source is None:
-            continue
-        if any(marker in source for marker in _VEC_ISA_CPP_SOURCE_MARKERS):
-            return True
-    return False
-
-
 def _resolve_needs_vec_isa(
     base_device_type: str, source: str | None, explicit: bool | None
 ) -> bool:
+    """Whether a given C++ TU should be compiled with CPU vec-ISA flags.
+
+    The caller may pass ``explicit=True/False`` to force-enable or force-disable
+    the vec-ISA probe; otherwise we infer:
+      * CPU wrappers always need vec-ISA (they may use at::vec host helpers).
+      * Non-CPU wrappers only need it if the generated source actually
+        references vec-ISA markers (rare, but possible for mixed host code).
+    """
     if explicit is not None:
         return explicit
     if source is None:
         return False
-    return base_device_type == "cpu" or _source_uses_vec_isa(source)
+    if base_device_type == "cpu":
+        return True
+    return any(marker in source for marker in _VEC_ISA_CPP_SOURCE_MARKERS)
 
 
 @clear_on_fresh_cache
@@ -3465,6 +3466,10 @@ class CppCodeCache:
         optimized_needs_vec_isa = _resolve_needs_vec_isa(
             base_device_type, optimized_code, optimized_needs_vec_isa
         )
+        # Only pay the CPU-side ISA probe if something in the generated code
+        # actually needs it. Non-CPU wrappers (e.g. CUDA cpp_wrapper host TUs)
+        # can usually skip the probe entirely, which is the dominant warm-path
+        # code_gen_time_s win for the CUDA cpp_wrapper path.
         picked_vec_isa = (
             pick_vec_isa()
             if main_needs_vec_isa or optimized_needs_vec_isa
@@ -3482,9 +3487,7 @@ class CppCodeCache:
         }
         optimized_compile_command = {
             **shared_compile_command,
-            "vec_isa": (
-                picked_vec_isa if optimized_needs_vec_isa else invalid_vec_isa
-            ),
+            "vec_isa": (picked_vec_isa if optimized_needs_vec_isa else invalid_vec_isa),
         }
 
         _set_gpu_runtime_env()  # cpp_extension consults the env
@@ -3596,7 +3599,7 @@ class CppCodeCache:
                 )
 
                 worker_fn = functools.partial(
-                    _worker_compile_cpp_with_timing,
+                    _worker_compile_cpp,
                     lock_path,
                     (
                         ("CppCodeCache.compile_main", main_builder),
@@ -3607,7 +3610,7 @@ class CppCodeCache:
                 binary_path = normalize_path_separator(linker.get_target_file_path())
             else:
                 worker_fn = functools.partial(
-                    _worker_compile_cpp_with_timing,
+                    _worker_compile_cpp,
                     lock_path,
                     (("CppCodeCache.compile_main", main_builder),),
                 )
@@ -3643,20 +3646,14 @@ class CppCodeCache:
 
 def _worker_compile_cpp(
     lock_path: str,
-    cpp_builders: Sequence[CppBuilder],
-) -> None:
-    from torch.utils._filelock import FileLock
-
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT):
-        for builder in cpp_builders:
-            if not os.path.exists(builder.get_target_file_path()):
-                builder.build()
-
-
-def _worker_compile_cpp_with_timing(
-    lock_path: str,
     cpp_builders: Sequence[tuple[str, CppBuilder]],
 ) -> None:
+    """Build each (phase_name, builder) under a file lock, skipping completed targets.
+
+    Each build step is wrapped in its own dynamo_timed phase so cpp_wrapper warm
+    compile traces attribute time back to the shared code cache instead of a
+    single opaque compile span.
+    """
     from torch.utils._filelock import FileLock
 
     with FileLock(lock_path, timeout=LOCK_TIMEOUT):

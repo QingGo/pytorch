@@ -17,7 +17,7 @@ from torch._inductor.runtime.runtime_utils import dynamo_timed
 from torch.utils._ordered_set import OrderedSet
 
 from .. import config
-from ..codecache import CudaKernelParamCache, write_text
+from ..codecache import CudaKernelParamCache, write
 from ..ir import (
     GraphPartitionSignature,
     TensorBox,
@@ -463,15 +463,15 @@ class DeferredTritonCallWrapper:
             wrapper.write_tma_descriptor_helpers_once()
 
         kernel_source_str = self.kernel_name_to_body.get(kernel_name, "")
-        kernel_source_path = write_text(kernel_source_str)
+        kernel_source_key, _kernel_source_path = write(kernel_source_str, "txt")
         prefix.writeline(
-            f"static const char* {kernel_name}_source_path = "
-            f"{cpp_string_literal(kernel_source_path)};"
+            f"static const char* {kernel_name}_source_key = "
+            f"{cpp_string_literal(kernel_source_key)};"
         )
         prefix.writeline(f"static LazyTritonKernelState {kernel_name}_state;")
         prefix.writeline(
             f"static const LazyTritonKernelSpec {kernel_name}_spec = "
-            f'{{"{kernel_name}", {kernel_name}_source_path}};'
+            f'{{"{kernel_name}", {kernel_name}_source_key}};'
         )
 
         wrapper_arg_names, kernel_arg_names = self._resolve_lazy_arg_names()
@@ -505,27 +505,24 @@ class DeferredTritonCallWrapper:
                 dtype, tensor_name, scalar_var, indented_buffer=prefix
             )
         # Lazy compile with autotuning on first invocation
+        ensure_args = [
+            "&_triton_kernel_module_state",
+            f"&{kernel_name}_spec",
+            f"&{kernel_name}_state",
+            "stream_",
+        ]
+        if autotune_args:
+            ensure_args.append(autotune_args)
+        ensure_call = ",\n            ".join(ensure_args)
         with prefix.indent():
-            prefix.writeline("if (ensureLazyTritonKernelReady(")
-            with prefix.indent():
-                ensure_args = [
-                    "&_triton_kernel_module_state",
-                    f"&{kernel_name}_spec",
-                    f"&{kernel_name}_state",
-                    "stream_",
-                ]
-                if autotune_args:
-                    ensure_args.append(autotune_args)
-                for i, arg in enumerate(ensure_args):
-                    comma = "," if i < len(ensure_args) - 1 else ""
-                    prefix.writeline(f"{arg}{comma}")
-            prefix.writeline(")) {")
-            with prefix.indent():
-                prefix.writeline(
-                    "// First invocation already ran the kernel, so return early"
-                )
-                prefix.writeline("return;")
-            prefix.writeline("}")
+            prefix.splice(
+                f"""\
+if (ensureLazyTritonKernelReady(
+            {ensure_call})) {{
+    return;  // first call already ran the kernel
+}}
+"""
+            )
 
             self._generate_lazy_grid(prefix)
             self._generate_lazy_launch(
@@ -904,28 +901,24 @@ class CppWrapperGpu(CppWrapperCpu):
             self.prefix.writeline("\n")
             kernel.generate(self)
 
-        # Generate parallel kernel compilation initialization function
+        # Kick off parallel compile for all lazy Triton kernels at module load.
+        # Emitting a file-scope struct with a ctor keeps this off the hot path
+        # and avoids threading an explicit init call through inductor_entry_impl.
         if self._lazy_kernel_names:
-            kernel_specs = "\n    ".join(
+            kernel_specs = "\n        ".join(
                 f"&{name}_spec," for name in self._lazy_kernel_names
             )
             self.prefix.splice(
                 f"""\
-// Start parallel compilation of all Triton kernels
-static inline void start_all_triton_kernel_compiles() {{
-    static const LazyTritonKernelSpec* kernel_specs[] = {{
-    {kernel_specs}
-    }};
-    startKernelCompilesForModule(
-        &_triton_kernel_module_state,
-        kernel_specs,
-        sizeof(kernel_specs) / sizeof(kernel_specs[0]));
-}}
-
-// Static initializer to start kernel compilation on module load
 static struct TritonKernelCompileInit {{
     TritonKernelCompileInit() {{
-        start_all_triton_kernel_compiles();
+        static const LazyTritonKernelSpec* kernel_specs[] = {{
+        {kernel_specs}
+        }};
+        startKernelCompilesForModule(
+            &_triton_kernel_module_state,
+            kernel_specs,
+            sizeof(kernel_specs) / sizeof(kernel_specs[0]));
     }}
 }} __triton_kernel_compile_init;
 """

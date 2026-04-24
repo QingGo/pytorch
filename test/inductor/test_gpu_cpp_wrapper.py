@@ -354,12 +354,14 @@ class TestGpuWrapper(InductorTestCase):
         self.assertIn("ensureLazyTritonKernelReady(", code)
         self.assertIn("startKernelCompilesForModule(", code)
         self.assertIn("launchLazyTritonKernel(", code)
-        self.assertIn("_source_path =", code)
+        self.assertIn("_source_key =", code)
         self.assertIn("needs_vec_isa=False", code)
+        self.assertNotIn("_source_path =", code)
         self.assertNotIn("_module_pending_kernels = PyDict_New()", code)
         self.assertNotIn("CUdeviceptr global_scratch_ptr = 0;", code)
         self.assertNotIn("void* kernel_args_[] = {", code)
         self.assertNotIn('R"TRITON(', code)
+
 
 instantiate_parametrized_tests(TestGpuWrapper)
 
@@ -397,6 +399,32 @@ res.backward()
 assert torch.allclose(res.detach(), ref.detach()), f"Forward mismatch: {res} vs {ref}"
 for i, (a, r) in enumerate(zip(args, ref_args)):
     assert torch.allclose(a.grad, r.grad), f"Grad mismatch for arg {i}"
+"""
+
+
+_LAZY_COMPILE_REPEATED_TEMP_CACHE_SCRIPT = """\
+import tempfile
+
+import torch
+from torch._inductor import config
+from torch._inductor.runtime.cache_dir_utils import temporary_cache_dir
+from torch.testing._internal.inductor_utils import GPU_TYPE
+
+config.triton.autotune_at_compile_time = False
+
+def fn(a, b, c):
+    return torch.mm(a, b) + torch.relu(torch.sin(c) + 1)
+
+for _ in range(2):
+    torch._dynamo.reset()
+    with tempfile.TemporaryDirectory(prefix="inductor_mixed_") as cache_dir:
+        with temporary_cache_dir(cache_dir):
+            a = torch.randn(64, 64, device=GPU_TYPE)
+            b = torch.randn(64, 64, device=GPU_TYPE)
+            c = torch.randn(64, 64, device=GPU_TYPE)
+            expected = fn(a, b, c)
+            actual = torch.compile(fn, options={"cpp_wrapper": True})(a, b, c)
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 """
 
 
@@ -438,6 +466,22 @@ class TestLazyCompileKernelCollision(InductorTestCase):
                 env=env,
             )
             self.assertEqual(r2.returncode, 0, f"Warm run failed:\n{r2.stderr[-2000:]}")
+
+    def test_lazy_compile_repeated_temp_cache_mixed_graph(self):
+        if not RUN_GPU:
+            self.skipTest("GPU not available")
+
+        env = {
+            **os.environ,
+            "INDUCTOR_TEST_DISABLE_FRESH_CACHE": "1",
+        }
+        r = subprocess.run(
+            [sys.executable, "-c", _LAZY_COMPILE_REPEATED_TEMP_CACHE_SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(r.returncode, 0, f"Run failed:\n{r.stderr[-2000:]}")
 
 
 class DynamicShapesGpuWrapperGpuTests(InductorTestCase):
