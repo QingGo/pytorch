@@ -7,11 +7,6 @@
 #include <c10/util/Array.h>
 #include <torch/library.h>
 
-#include <ntverp.h>
-#define STRINGIFY2(x) #x
-#define STRINGIFY(x) STRINGIFY2(x)
-#pragma message("Windows SDK build: " STRINGIFY(VER_PRODUCTBUILD))
-
 namespace {
 bool check_head_dim_size_xpu(sdp::sdp_params const& params, bool debug) {
   const auto query_size_last = params.query.sym_size(-1);
