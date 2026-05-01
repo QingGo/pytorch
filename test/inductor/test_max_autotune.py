@@ -1502,7 +1502,13 @@ class TestMaxAutotune(TestCase):
                 self.assertEqual(out, m(input_tensor))
 
                 if not TEST_WITH_ROCM:
-                    FileCheck().check("def triton_poi_fused_add_cat_").run(code[0])
+                    expected = (
+                        "static const LazyTritonKernelSpec triton_poi_fused_add_cat_"
+                        if config.cpp_wrapper
+                        and not config.triton.autotune_at_compile_time
+                        else "def triton_poi_fused_add_cat_"
+                    )
+                    FileCheck().check(expected).run(code[0])
 
     @parametrize("search_space", ("DEFAULT", "EXHAUSTIVE"))
     def test_conv3d(self, search_space):

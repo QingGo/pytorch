@@ -2,4 +2,4 @@
 
 #include <torch/csrc/inductor/aoti_include/common.h>
 #include <torch/csrc/inductor/aoti_include/kernel_compile_result.h>
-#include <torch/csrc/inductor/cpp_wrapper/device_internal/cuda.h>
+#include <torch/csrc/inductor/cpp_wrapper/device_internal/cuda_kernel_launch.h>

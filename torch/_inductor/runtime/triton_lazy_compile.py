@@ -132,7 +132,7 @@ def start_kernel_compile(
     kernel_source_path = _resolve_kernel_source_path(kernel_source_key)
     with open(kernel_source_path) as f:
         kernel_source = f.read()
-    kernel_obj = eval(kernel_source.strip())  # noqa: S307
+    kernel_obj = eval(kernel_source.strip())
 
     pending_kernels[pending_key] = kernel_obj
 
