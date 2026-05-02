@@ -1,4 +1,6 @@
 # Owner(s): ["module: inductor"]
+from pathlib import Path
+
 import torch
 from torch._inductor.codegen.aoti_hipify_utils import maybe_hipify_code_wrapper
 from torch._inductor.codegen.common import get_device_op_overrides
@@ -38,87 +40,21 @@ class TestCppWrapperHipify(TestCase):
 
     def test_hipify_aoti_driver_header(self) -> None:
         cuda_codegen = get_device_op_overrides("cuda")
-        header = cuda_codegen.kernel_driver()
-        expected = """
-            #define CUDA_DRIVER_CHECK(EXPR)                    \\
-            do {                                               \\
-                hipError_t code = EXPR;                          \\
-                const char *msg;                               \\
-                hipError_t code_get_error = hipDrvGetErrorString(code, &msg); \\
-                if (code_get_error != hipSuccess) {          \\
-                    throw std::runtime_error(                  \\
-                        std::string("CUDA driver error: ") +   \\
-                        std::string("invalid error code!"));   \\
-                }                                              \\
-                if (code != hipSuccess) {                    \\
-                    throw std::runtime_error(                  \\
-                        std::string("CUDA driver error: ") +   \\
-                        std::string(msg));                     \\
-                }                                              \\
-            } while (0);
+        self.assertEqual(cuda_codegen.kernel_driver(), "")
 
-            static inline hipFunction_t loadKernel(
-                    std::string filePath,
-                    const std::string &funcName,
-                    uint32_t sharedMemBytes,
-                    const std::optional<std::string> &cubinDir = std::nullopt) {
-                if (cubinDir) {
-                    std::filesystem::path p1{*cubinDir};
-                    std::filesystem::path p2{filePath};
-                    filePath = (p1 / p2.filename()).string();
-                }
-
-                hipModule_t mod;
-                hipFunction_t func;
-                CUDA_DRIVER_CHECK(hipModuleLoad(&mod, filePath.c_str()));
-                CUDA_DRIVER_CHECK(hipModuleGetFunction(&func, mod, funcName.c_str()));
-                if (sharedMemBytes > 0) {
-                    CUDA_DRIVER_CHECK(hipFuncSetAttribute(
-                        func,
-                        hipFuncAttributeMaxDynamicSharedMemorySize,
-                        sharedMemBytes
-                    ))
-                }
-                return func;
-            }
-
-            static inline hipFunction_t loadKernel(const void* start, const std::string &funcName, uint32_t sharedMemBytes) {
-                hipModule_t mod;
-                hipFunction_t func;
-                CUDA_DRIVER_CHECK(hipModuleLoadData(&mod, start));
-                CUDA_DRIVER_CHECK(hipModuleGetFunction(&func, mod, funcName.c_str()));
-                if (sharedMemBytes > 0) {
-                    CUDA_DRIVER_CHECK(hipFuncSetAttribute(
-                        func,
-                        hipFuncAttributeMaxDynamicSharedMemorySize,
-                        sharedMemBytes
-                    ))
-                }
-                return func;
-            }
-
-            static inline void launchKernel(
-                    hipFunction_t func,
-                    uint32_t gridX,
-                    uint32_t gridY,
-                    uint32_t gridZ,
-                    uint32_t numWarps,
-                    uint32_t sharedMemBytes,
-                    void* args[],
-                    hipStream_t stream) {
-                CUDA_DRIVER_CHECK(hipModuleLaunchKernel(
-                    func, gridX, gridY, gridZ, 32*numWarps, 1, 1, sharedMemBytes, stream, args, nullptr
-                ));
-            }
-        """
-        if torch.version.hip is not None:
-            # Adjusting the warp size to GPU supported wavefront size on AMD GPU
-            prop = torch.cuda.get_device_properties(torch.cuda.current_device())
-            expected = expected.replace(
-                "32*numWarps", str(prop.warp_size) + "*numWarps"
-            )
+        header_path = (
+            Path(__file__).resolve().parents[2]
+            / "torch/csrc/inductor/cpp_wrapper/device_internal/cuda_kernel_launch.h"
+        )
+        header = header_path.read_text()
         result = maybe_hipify_code_wrapper(header, True)
-        self.assertEqual(result.rstrip(), expected.rstrip())
+
+        self.assertIn("hipModuleLoad(&mod, filePath.c_str())", result)
+        self.assertIn("hipModuleLoadData(&mod, start)", result)
+        self.assertIn("hipModuleGetFunction(&func, mod, funcName.c_str())", result)
+        self.assertIn("hipFuncAttributeMaxDynamicSharedMemorySize", result)
+        self.assertIn("hipModuleLaunchKernel", result)
+        self.assertNotIn("Embedded kernel binary load is not supported", result)
 
     def test_hipify_cross_platform(self) -> None:
         if len(TEST_CODES) != len(HIP_CODES):

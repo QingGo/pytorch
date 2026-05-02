@@ -528,7 +528,14 @@ class ComboKernelTests(TestCase):
 
         self.assertEqual(out_eager, out_compiled)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
-        if torch._inductor.config.combo_kernel_per_subkernel_blocks:
+        if (
+            torch._inductor.config.cpp_wrapper
+            and not torch._inductor.config.triton.autotune_at_compile_time
+        ):
+            FileCheck().check(
+                "static const LazyTritonKernelSpec triton_poi_fused_0_spec"
+            ).check("launchLazyTritonKernel(").run(code[0])
+        elif torch._inductor.config.combo_kernel_per_subkernel_blocks:
             FileCheck().check("x_pid_offset = local_pid % x_blocks_0").check(
                 "y_pid_offset = local_pid // x_blocks_0"
             ).run(code[0])
