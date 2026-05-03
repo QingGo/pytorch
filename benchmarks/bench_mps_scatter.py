@@ -102,6 +102,9 @@ if __name__ == "__main__":
         (4096, 64, 0, "amax", torch.float32),
         (4096, 64, 0, "amin", torch.float32),
         (4096, 64, 0, "set", torch.float32),
+        (4096, 64, 0, "add", torch.int64),
+        (4096, 64, 0, "prod", torch.int64),
+        (4096, 64, 0, "amax", torch.int64),
     ]
     print(f"{'Config':<50} {'ms':>8}")
     print("-" * 60)

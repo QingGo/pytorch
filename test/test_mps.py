@@ -7915,6 +7915,49 @@ class TestMPS(TestCaseMPS):
 
         self.assertEqual(result_mps, result_cpu)
 
+    def test_scatter_long_full_metal(self):
+        """Test all scatter ops with torch.int64 (exercises atomic_binary_op<long>)."""
+        N, D = 32, 16
+        cpu_x_base = torch.zeros(N, D, dtype=torch.long, device="cpu")
+        cpu_src = torch.randint(1, 10, (N * 2, D), dtype=torch.long, device="cpu")
+        idx = torch.randint(0, N, (N * 2, D), dtype=torch.int64)
+
+        # scatter_set (use unique indices since set with duplicates is non-deterministic on GPU)
+        idx_unique = torch.arange(N, dtype=torch.int64).unsqueeze(1).expand(N, D)
+        src_set = cpu_src[:N]
+        r = cpu_x_base.clone().to("mps").scatter(0, idx_unique.to("mps"), src_set.to("mps"))
+        e = cpu_x_base.clone().scatter(0, idx_unique, src_set)
+        self.assertEqual(r, e)
+
+        # scatter_add
+        r = cpu_x_base.clone().to("mps").scatter_add(0, idx.to("mps"), cpu_src.to("mps"))
+        e = cpu_x_base.clone().scatter_add(0, idx, cpu_src)
+        self.assertEqual(r, e)
+
+        # scatter_reduce prod
+        ones = torch.ones(N, D, dtype=torch.long, device="cpu")
+        r = ones.clone().to("mps").scatter_reduce(0, idx.to("mps"), cpu_src.to("mps"), reduce="prod")
+        e = ones.clone().scatter_reduce(0, idx, cpu_src, reduce="prod")
+        self.assertEqual(r, e)
+
+        # scatter_reduce amax
+        r = cpu_x_base.clone().to("mps").scatter_reduce(0, idx.to("mps"), cpu_src.to("mps"), reduce="amax")
+        e = cpu_x_base.clone().scatter_reduce(0, idx, cpu_src, reduce="amax")
+        self.assertEqual(r, e)
+
+        # scatter_reduce amin
+        big = torch.full((N, D), 1000, dtype=torch.long, device="cpu")
+        r = big.clone().to("mps").scatter_reduce(0, idx.to("mps"), cpu_src.to("mps"), reduce="amin")
+        e = big.clone().scatter_reduce(0, idx, cpu_src, reduce="amin")
+        self.assertEqual(r, e)
+
+        # gather
+        x = torch.arange(N * D, dtype=torch.long, device="mps").reshape(N, D)
+        idx_g = torch.randint(0, N, (N, D), dtype=torch.int64)
+        r = torch.gather(x, 0, idx_g.to("mps"))
+        e = torch.gather(x.cpu(), 0, idx_g)
+        self.assertEqual(r, e)
+
     def test_scatter_high_dim_metal(self):
         """Test scatter on 5D tensor."""
         cpu_x = torch.zeros(4, 3, 2, 5, 6, device='cpu', dtype=torch.float32)
