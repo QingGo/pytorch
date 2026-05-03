@@ -209,3 +209,12 @@ REGISTER_ALL_INDEX_TYPES(int);
 REGISTER_ALL_INDEX_TYPES(short);
 REGISTER_ALL_INDEX_TYPES(char);
 REGISTER_ALL_INDEX_TYPES(uchar);
+
+// long (int64_t) - no scatter_reduce since AtomicType<long> lacks atomic_binary_op
+#define REGISTER_LONG_OPS(IT)            \
+  REGISTER_SCATTER_SET(long, IT)         \
+  REGISTER_SCATTER_ADD(long, IT)         \
+  REGISTER_GATHER(long, IT)
+
+REGISTER_LONG_OPS(int);
+REGISTER_LONG_OPS(long);

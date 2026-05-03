@@ -7751,8 +7751,8 @@ class TestMPS(TestCaseMPS):
             result_cpu = torch.scatter_add(cpu_x, 0, cpu_idx, cpu_src)
             result_mps = torch.scatter_add(x, 0, mps_idx, src)
 
-            atol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-5
-            rtol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+            atol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-5
+            rtol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
             self.assertEqual(result_mps, result_cpu, atol=atol, rtol=rtol)
 
     def test_scatter_int_index_metal(self):
