@@ -74,7 +74,9 @@ from ._aot_autograd.utils import (
     _is_fwd_seed_offset,
     _is_primal,
     _is_tangent,
-    get_cuda_generator_meta_val,
+    get_device_rng_state,
+    get_generator_meta_val,
+    supports_graphsafe_rng,
 )
 from .compile_utils import fx_graph_cse, get_aten_target, raise_getitems
 
@@ -1663,14 +1665,14 @@ def apply_graphsafe_rng_functionalization(
     # functionalization. See note above [CUDA Graph Safe RNG Functionalization]
     with fw_module.graph.inserting_after(last_fwd_input):
         fwd_rng_state = fw_module.graph.placeholder(f"fwd_rng_state_{rng_count}")
-        fwd_rng_state.meta["val"] = get_cuda_generator_meta_val(device_idx)
+        fwd_rng_state.meta["val"] = get_generator_meta_val(device)
         last_fwd_input = fwd_rng_state
 
     # Handle backward pass
     with bw_module.graph.inserting_after(last_bwd_input):
         bwd_rng_state = bw_module.graph.placeholder(f"bwd_rng_state_{rng_count}")
         # as above, clone so that meta val generator will not contain tensors
-        bwd_rng_state.meta["val"] = get_cuda_generator_meta_val(device_idx)
+        bwd_rng_state.meta["val"] = get_generator_meta_val(device)
         last_bwd_input = bwd_rng_state
 
     # Update forward node
@@ -1753,7 +1755,7 @@ def functionalize_rng_ops(
 
         for candidate in candidates:
             if isinstance(candidate, torch.Tensor):
-                if candidate.device.type == "cuda":
+                if supports_graphsafe_rng(candidate.device):
                     return candidate.device
 
         return torch.device("cpu")
@@ -1765,8 +1767,8 @@ def functionalize_rng_ops(
         if fake_mode is None:
             raise AssertionError("fake_mode must not be None")
         with fake_mode:
-            if device is not None and device.type == "cuda":
-                return fake_mode.from_tensor(torch.cuda.get_rng_state())
+            if device is not None and supports_graphsafe_rng(device):
+                return fake_mode.from_tensor(get_device_rng_state(device))
             return fake_mode.from_tensor(torch.get_rng_state())
 
     # Step 1 - Construct a mapping of rng node between the fwd and its counterpart in bwd.
@@ -1841,7 +1843,7 @@ def functionalize_rng_ops(
         if (
             use_rng_graphsafe_rng_functionalization
             and device is not None
-            and device.type == "cuda"
+            and supports_graphsafe_rng(device)
         ):
             last_fwd_input, last_bwd_input = apply_graphsafe_rng_functionalization(
                 fw_module,

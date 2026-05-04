@@ -727,6 +727,52 @@ def get_cuda_generator_meta_val(device_idx: int) -> Any:
     return torch.cuda.default_generators[device_idx].clone_state()
 
 
+_GRAPHSAFE_RNG_DEVICE_TYPES: set[str] = {"cuda"}
+
+
+def register_graphsafe_rng_device_type(device_type: str) -> None:
+    """Register a device type as supporting graphsafe RNG operations.
+
+    Backends that provide ``torch.<device_type>.default_generators`` with
+    generators implementing ``graphsafe_get_state()`` / ``graphsafe_set_state()``
+    should call this at import time.
+    """
+    _GRAPHSAFE_RNG_DEVICE_TYPES.add(device_type)
+
+
+def supports_graphsafe_rng(device: torch.device) -> bool:
+    """Check whether a device supports graphsafe RNG operations."""
+    return device.type in _GRAPHSAFE_RNG_DEVICE_TYPES
+
+
+def get_default_generator(device: torch.device) -> Any:
+    """Get the default RNG generator for a device.
+
+    Callers should check :func:`supports_graphsafe_rng` before calling this.
+    """
+    device_mod = getattr(torch, device.type, None)
+    if device_mod is None or not hasattr(device_mod, "default_generators"):
+        raise AssertionError(
+            f"Device type '{device.type}' does not have default_generators. "
+            f"Registered graphsafe RNG types: {sorted(_GRAPHSAFE_RNG_DEVICE_TYPES)}."
+        )
+    idx = device.index if device.index is not None else 0
+    return device_mod.default_generators[idx]
+
+
+def get_generator_meta_val(device: torch.device) -> Any:
+    """Device-generic version of get_cuda_generator_meta_val."""
+    return get_default_generator(device).clone_state()
+
+
+def get_device_rng_state(device: torch.device) -> torch.Tensor:
+    """Get the RNG state tensor for a device."""
+    device_mod = getattr(torch, device.type, None)
+    if device_mod is not None and hasattr(device_mod, "get_rng_state"):
+        return device_mod.get_rng_state()
+    return torch.get_rng_state()
+
+
 def top_saved_tensors_hooks() -> Any:
     return torch._C._autograd._top_saved_tensors_default_hooks(True)
 

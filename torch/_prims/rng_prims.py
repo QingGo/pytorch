@@ -347,14 +347,38 @@ def register_graphsafe_run_with_rng_state_op():
         generator.graphsafe_set_state(current_state)
         return out
 
+    @graphsafe_run_with_rng_state.py_impl(DispatchKey.PrivateUse1)
+    def impl_generic_device(op, *args, rng_state=None, **kwargs):
+        # pyrefly: ignore [missing-attribute]
+        device_idx = rng_state.device.index
+        device_type = rng_state.device.type  # pyrefly: ignore [missing-attribute]
+        device_mod = getattr(torch, device_type, None)
+        if device_mod is None or not hasattr(device_mod, "default_generators"):
+            raise AssertionError(
+                f"GraphSafe RNG operations not supported for device '{device_type}' "
+                f"(no torch.{device_type}.default_generators)"
+            )
+        generator = device_mod.default_generators[device_idx]
+        current_state = generator.graphsafe_get_state()
+
+        generator.graphsafe_set_state(rng_state)
+        out = op(*args, **kwargs)
+        generator.graphsafe_set_state(current_state)
+        return out
+
     @graphsafe_run_with_rng_state.py_impl(DispatchKey.BackendSelect)
     def impl_backend_select(op, *args, rng_state=None, **kwargs):
+        from torch._functorch._aot_autograd.utils import supports_graphsafe_rng
+
         device = get_device(args, kwargs)
-        if device != "cuda":
+        if not supports_graphsafe_rng(torch.device(device)):
             raise AssertionError(
-                f"GraphSafe RNG operations only supported for CUDA, got {device}"
+                f"GraphSafe RNG operations not supported for device '{device}'. "
+                f"Call register_graphsafe_rng_device_type('{device}') to register."
             )
-        return impl_cuda(op, *args, rng_state=rng_state, **kwargs)
+        if device == "cuda":
+            return impl_cuda(op, *args, rng_state=rng_state, **kwargs)
+        return impl_generic_device(op, *args, rng_state=rng_state, **kwargs)
 
     @graphsafe_run_with_rng_state.py_impl(FakeTensorMode)
     def impl_fake_tensor_mode(mode, op, *args, rng_state=None, **kwargs):
