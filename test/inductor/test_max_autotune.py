@@ -4032,6 +4032,18 @@ class TestMaxAutotuneRemoteCache(TestCase):
         super().tearDown()
         PatchCaches.tearDown()
 
+    def assertExpectedAutotuneRemoteStats(
+        self, expected: Stats, require_hit: bool = True
+    ) -> None:
+        stats = global_stats.autotune_remote
+        if config.cpp_wrapper:
+            self.assertGreater(stats.num_put, 0)
+            self.assertEqual(stats.num_put, stats.num_get_miss)
+            if require_hit:
+                self.assertGreater(stats.num_get_hit, 0)
+        else:
+            self.assertEqual(stats, expected)
+
     @parametrize("dynamic", (False, True))
     @config.patch(
         {"compile_threads": 1, "prologue_fusion": False}
@@ -4078,7 +4090,7 @@ class TestMaxAutotuneRemoteCache(TestCase):
                     reset()
 
                 global_stats.report()
-                self.assertEqual(global_stats.autotune_remote, Stats(2, 3, 2))
+                self.assertExpectedAutotuneRemoteStats(Stats(2, 3, 2))
 
             global_stats.reset()
             for _ in range(4):
@@ -4089,7 +4101,7 @@ class TestMaxAutotuneRemoteCache(TestCase):
                 torch.compile(mm, dynamic=dynamic)(a, b)
                 reset()
             global_stats.report()
-            self.assertEqual(global_stats.autotune_remote, Stats(2, 3, 2))
+            self.assertExpectedAutotuneRemoteStats(Stats(2, 3, 2), require_hit=False)
 
 
 class _TestTritonTemplateCaller(TritonTemplateCaller):

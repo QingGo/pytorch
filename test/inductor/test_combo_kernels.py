@@ -77,6 +77,22 @@ class ComboKernelTests(TestCase):
         torch._inductor.metrics.reset()
         super().tearDown()
 
+    def _check_lazy_cpp_wrapper_combo_codegen(self, code, source_check):
+        from torch._inductor.codecache import get_path
+
+        FileCheck().check("static const LazyTritonKernelSpec").check(
+            "launchLazyTritonKernel("
+        ).run(code)
+        source_keys = re.findall(
+            r'static const char\* \w+_source_key = "([^"]+)";', code
+        )
+        self.assertTrue(source_keys)
+        sources = []
+        for source_key in source_keys:
+            with open(get_path(source_key, "txt")[2]) as f:
+                sources.append(f.read())
+        source_check.run("\n".join(sources))
+
     @requires_gpu_and_triton
     def test_activation_functions(self):
         def test_activations(a, b, c):
@@ -330,7 +346,21 @@ class ComboKernelTests(TestCase):
         out_compiled, code = run_and_get_code(fn_c, *inps)
         self.assertEqual(out_eager, out_compiled)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
-        if torch._inductor.config.combo_kernel_per_subkernel_blocks:
+        if (
+            torch._inductor.config.cpp_wrapper
+            and not torch._inductor.config.triton.autotune_at_compile_time
+        ):
+            self._check_lazy_cpp_wrapper_combo_codegen(
+                code[0],
+                (
+                    FileCheck()
+                    .check("XBLOCK_0 : tl.constexpr")
+                    .check("XBLOCK_1 : tl.constexpr")
+                    if torch._inductor.config.combo_kernel_per_subkernel_blocks
+                    else FileCheck().check_not("XBLOCK_0 : tl.constexpr")
+                ),
+            )
+        elif torch._inductor.config.combo_kernel_per_subkernel_blocks:
             FileCheck().check("XBLOCK_0 : tl.constexpr").check(
                 "XBLOCK_1 : tl.constexpr"
             ).run(code[0])
@@ -351,7 +381,23 @@ class ComboKernelTests(TestCase):
         out_compiled, code = run_and_get_code(fn_c, *inps)
         torch.testing.assert_close(out_eager, out_compiled, atol=1e-4, rtol=1e-4)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
-        if torch._inductor.config.combo_kernel_per_subkernel_blocks:
+        if (
+            torch._inductor.config.cpp_wrapper
+            and not torch._inductor.config.triton.autotune_at_compile_time
+        ):
+            self._check_lazy_cpp_wrapper_combo_codegen(
+                code[0],
+                (
+                    FileCheck()
+                    .check("R0_BLOCK_0: tl.constexpr = 64")
+                    .check("R0_BLOCK_1: tl.constexpr = 512")
+                    if torch._inductor.config.combo_kernel_per_subkernel_blocks
+                    else FileCheck()
+                    .check("XBLOCK : tl.constexpr")
+                    .check_not("XBLOCK_0 : tl.constexpr")
+                ),
+            )
+        elif torch._inductor.config.combo_kernel_per_subkernel_blocks:
             # Per-subkernel: signature has XBLOCK_0, XBLOCK_1
             FileCheck().check("R0_BLOCK_0: tl.constexpr = 64").check(
                 "R0_BLOCK_1: tl.constexpr = 512"
@@ -377,7 +423,21 @@ class ComboKernelTests(TestCase):
         out_compiled, code = run_and_get_code(fn_c, *inps)
         torch.testing.assert_close(out_eager, out_compiled, atol=1e-4, rtol=1e-4)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
-        if torch._inductor.config.combo_kernel_per_subkernel_blocks:
+        if (
+            torch._inductor.config.cpp_wrapper
+            and not torch._inductor.config.triton.autotune_at_compile_time
+        ):
+            self._check_lazy_cpp_wrapper_combo_codegen(
+                code[0],
+                (
+                    FileCheck()
+                    .check("XBLOCK_0 : tl.constexpr")
+                    .check("XBLOCK_1 : tl.constexpr, R0_BLOCK_1 : tl.constexpr")
+                    if torch._inductor.config.combo_kernel_per_subkernel_blocks
+                    else FileCheck().check_not("XBLOCK_0 : tl.constexpr")
+                ),
+            )
+        elif torch._inductor.config.combo_kernel_per_subkernel_blocks:
             FileCheck().check("XBLOCK_0 : tl.constexpr").check(
                 "XBLOCK_1 : tl.constexpr, R0_BLOCK_1 : tl.constexpr"
             ).run(code[0])
@@ -400,7 +460,24 @@ class ComboKernelTests(TestCase):
         out_compiled, code = run_and_get_code(fn_c, *inps)
         torch.testing.assert_close(out_eager, out_compiled, atol=1e-4, rtol=1e-4)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
-        if torch._inductor.config.combo_kernel_per_subkernel_blocks:
+        if (
+            torch._inductor.config.cpp_wrapper
+            and not torch._inductor.config.triton.autotune_at_compile_time
+        ):
+            self._check_lazy_cpp_wrapper_combo_codegen(
+                code[0],
+                (
+                    FileCheck()
+                    .check(" XBLOCK_0 : tl.constexpr, R0_BLOCK_0 : tl.constexpr")
+                    .check("XBLOCK_1 : tl.constexpr, R0_BLOCK_1 : tl.constexpr")
+                    if torch._inductor.config.combo_kernel_per_subkernel_blocks
+                    else FileCheck()
+                    .check("XBLOCK : tl.constexpr")
+                    .check("R0_BLOCK : tl.constexpr")
+                    .check_not("XBLOCK_0 : tl.constexpr")
+                ),
+            )
+        elif torch._inductor.config.combo_kernel_per_subkernel_blocks:
             FileCheck().check(
                 " XBLOCK_0 : tl.constexpr, R0_BLOCK_0 : tl.constexpr"
             ).check("XBLOCK_1 : tl.constexpr, R0_BLOCK_1 : tl.constexpr").run(code[0])
