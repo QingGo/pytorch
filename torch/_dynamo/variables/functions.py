@@ -398,6 +398,10 @@ class BaseUserFunctionVariable(VariableTracker):
             self.dict_vt = variables.DunderDictVariable.create(tx, self)
         return self.dict_vt
 
+    def repr_impl(self, tx: Any) -> "VariableTracker":
+        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/funcobject.c
+        return VariableTracker.build(tx, repr(self.as_python_constant()))
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -1891,6 +1895,19 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
 
     def as_python_constant(self) -> types.FunctionType:
         return self.get_function()
+
+    def repr_impl(self, tx: Any) -> "VariableTracker":
+        try:
+            return super().repr_impl(tx)
+        except ClosureConversionError as e:
+            unimplemented(
+                gb_type="repr() on nested function with non-constructible closure",
+                context=f"repr() on nested function {self.fn_name.as_python_constant()}: {e}",
+                explanation="Dynamo could not safely evaluate repr() for this "
+                "nested function because it could not reconstruct its closure "
+                "as Python constants.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
 
     def get_code(self) -> types.CodeType:
         return self.code.as_python_constant()

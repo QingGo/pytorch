@@ -49,6 +49,7 @@ from ..utils import (
     raise_args_mismatch,
 )
 from .base import (
+    AsPythonConstantNotImplementedError,
     AttributeMutationExisting,
     AttributeMutationNew,
     NO_SUCH_SUBOBJ,
@@ -169,6 +170,20 @@ class ConstDictVariable(VariableTracker):
             k.vt.as_python_constant(): v.as_python_constant()
             for k, v in self.items.items()
         }
+
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c
+        try:
+            return VariableTracker.build(tx, repr(self.as_python_constant()))
+        except AsPythonConstantNotImplementedError:
+            unimplemented(
+                gb_type="repr() on non-constant dict",
+                context=f"repr() on {type(self).__name__} with non-constant keys or values",
+                explanation="Dynamo could not safely evaluate repr() for this "
+                "dict-like object because one or more keys or values are not "
+                "Python constants.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
 
     def keys_as_python_constant(self) -> dict[Any, VariableTracker]:
         self.install_dict_keys_match_guard()
@@ -976,16 +991,22 @@ class DictViewVariable(VariableTracker):
             return ConstantVariable.create(True)
         return ConstantVariable.create(False)
 
-    def call_method(
-        self,
-        tx: "InstructionTranslator",
-        name: str,
-        args: list[VariableTracker],
-        kwargs: dict[str, VariableTracker],
-    ) -> VariableTracker:
-        if name == "__repr__":
-            return VariableTracker.build(tx, self.debug_repr())
-        return super().call_method(tx, name, args, kwargs)
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c
+        try:
+            d = self.dv_dict.as_python_constant()
+            assert self.kv is not None
+            view = getattr(d, self.kv)()
+            return VariableTracker.build(tx, repr(view))
+        except AsPythonConstantNotImplementedError:
+            unimplemented(
+                gb_type="repr() on non-constant dict view",
+                context=f"repr() on {type(self).__name__} with non-constant backing dict",
+                explanation="Dynamo could not safely evaluate repr() for this "
+                "dict view because its backing dict could not be materialized as "
+                "a Python constant.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
 
     def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
         """Sequence length for dict view objects."""
@@ -1038,7 +1059,7 @@ class DictKeysVariable(DictViewVariable):
                     repr(k.vt.value) if hasattr(k.vt, "value") else k.vt.debug_repr()
                 )
                 items.append(key_str)
-            return "dict_keys([" + ",".join(items) + "])"
+            return "dict_keys([" + ", ".join(items) + "])"
 
     def sq_contains(
         self, tx: "InstructionTranslator", item: VariableTracker
@@ -1135,7 +1156,7 @@ class DictValuesVariable(DictViewVariable):
             for v in self.view_items:
                 val_str = repr(v.value) if hasattr(v, "value") else v.debug_repr()
                 items.append(val_str)
-            return "dict_values([" + ",".join(items) + "])"
+            return "dict_values([" + ", ".join(items) + "])"
 
 
 class DictItemsVariable(DictViewVariable):
@@ -1170,7 +1191,7 @@ class DictItemsVariable(DictViewVariable):
                 )
                 val_str = repr(v.value) if hasattr(v, "value") else v.debug_repr()
                 items.append(f"({key_str}, {val_str})")
-            return "dict_items([" + ",".join(items) + "])"
+            return "dict_items([" + ", ".join(items) + "])"
 
     def sq_contains(
         self, tx: "InstructionTranslator", item: VariableTracker

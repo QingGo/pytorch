@@ -99,7 +99,13 @@ from ..utils import (
     tuple_methods,
     unpatched_nn_module_getattr,
 )
-from .base import MutationType, NO_SUCH_SUBOBJ, ValueMutationNew, VariableTracker
+from .base import (
+    AsPythonConstantNotImplementedError,
+    MutationType,
+    NO_SUCH_SUBOBJ,
+    ValueMutationNew,
+    VariableTracker,
+)
 from .dicts import ConstDictVariable, pydict_check
 from .hashable import HashableTracker
 from .object_protocol import is_nb_not_implemented, type_implements_nb_slot
@@ -439,6 +445,17 @@ class UserDefinedClassVariable(UserDefinedVariable):
         if hasattr(metaclass, "__bool__") and metaclass is not type:
             return self.call_method(tx, "__bool__", [], {})
         return ConstantVariable.create(True)
+
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/typeobject.c
+        metaclass = type(self.value)
+        if metaclass is type or type(self.value).__repr__ is type.__repr__:
+            return VariableTracker.build(tx, repr(self.value))
+
+        type_attr = self.lookup_metaclass_attr("__repr__")
+        if type_attr is None:
+            raise_type_error(tx, "'NoneType' object is not callable")
+        return self.call_method(tx, "__repr__", [], {})
 
     def nb_or_impl(
         self,
@@ -1687,6 +1704,48 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 f"__bool__ should return bool, returned {result.python_type().__name__}",
             )
         return result
+
+    def repr_impl(
+        self,
+        tx: "InstructionTranslator",
+    ) -> VariableTracker:
+        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/typeobject.c
+        type_attr = self.lookup_class_mro_attr("__repr__")
+        if type_attr is NO_SUCH_SUBOBJ:
+            return super().repr_impl(tx)
+        if type_attr is None:
+            raise_type_error(tx, "'NoneType' object is not callable")
+
+        method = self._maybe_get_baseclass_method("__repr__")
+        if (
+            self._base_vt is not None
+            and self._base_methods is not None
+            and method in self._base_methods
+        ):
+            return self._base_vt.repr_impl(tx)
+
+        if type(self.value).__repr__ is object.__repr__:
+            return VariableTracker.build(tx, repr(self.value))
+
+        source = self.source and self.get_source_by_walking_mro(tx, "__repr__")
+        method_var = self.resolve_type_attr(tx, "__repr__", type_attr, source)
+        if not isinstance(method_var, variables.GetAttrVariable):
+            return method_var.call_function(tx, [], {})
+
+        try:
+            inspect.getattr_static(type(type_attr), "__get__")(
+                type_attr, self.value, type(self.value)
+            )
+        except (AttributeError, TypeError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
+        unimplemented(
+            gb_type="untraceable user-defined __repr__",
+            context=f"Could not trace __repr__ override for {type(self.value).__name__}",
+            explanation="Dynamo could not safely trace this user-defined __repr__ override.",
+            hints=[*graph_break_hints.SUPPORTABLE],
+            skip_frame=True,
+        )
 
     def nb_index_impl(
         self,
@@ -3445,7 +3504,13 @@ class UserDefinedExceptionObjectVariable(UserDefinedObjectVariable):
         return self._base_vt.python_stack  # type: ignore[missing-attribute]
 
     def debug_repr(self) -> str:
-        return self._base_vt.debug_repr()  # type: ignore[missing-attribute]
+        return self.exc_vt.debug_repr()
+
+    def repr_impl(self, tx: "InstructionTranslator") -> "VariableTracker":
+        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/exceptions.c
+        if type(self.value).__repr__ is not BaseException.__repr__:
+            return super().repr_impl(tx)
+        return self.exc_vt.repr_impl(tx)
 
     @python_stack.setter
     def python_stack(self, value: traceback.StackSummary) -> None:
@@ -3873,20 +3938,19 @@ class DefaultDictVariable(UserDefinedDictVariable):
         )
 
     def is_python_constant(self) -> bool:
-        if self._base_vt is None:
-            raise AssertionError("_base_vt must not be None in is_python_constant")
-        # An empty defaultdict with a non-constant factory can't be
-        # constant-folded (we can't serialize the factory).
-        if not self.default_factory.is_python_constant() and not self._base_vt.items:  # type: ignore[union-attr]
+        assert self._base_vt is not None
+        if not self.default_factory.is_python_constant():
             return False
         return self._base_vt.is_python_constant()
 
     def as_python_constant(self) -> Any:
-        if self._base_vt is None:
-            raise AssertionError("_base_vt must not be None in as_python_constant")
-        factory = None
-        if self.default_factory.is_python_constant():
-            factory = self.default_factory.as_python_constant()
+        assert self._base_vt is not None
+        if not self.default_factory.is_python_constant():
+            raise AsPythonConstantNotImplementedError(
+                self,
+                "defaultdict default_factory is not a Python constant",
+            )
+        factory = self.default_factory.as_python_constant()
         return collections.defaultdict(factory, self._base_vt.as_python_constant())
 
     def debug_repr(self) -> str:
@@ -3898,6 +3962,21 @@ class DefaultDictVariable(UserDefinedDictVariable):
             f"defaultdict({self.default_factory.debug_repr()}, "
             f"{self._base_vt.debug_repr()})"
         )
+
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        # ref: https://github.com/python/cpython/blob/v3.13.3/Modules/_collectionsmodule.c
+        try:
+            return VariableTracker.build(tx, repr(self.as_python_constant()))
+        except AsPythonConstantNotImplementedError:
+            unimplemented(
+                gb_type="repr() on non-constant defaultdict",
+                context="repr() on defaultdict with non-constant default_factory "
+                "or values",
+                explanation="Dynamo could not safely evaluate repr() for this "
+                "defaultdict because its default_factory or contents are not "
+                "Python constants.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
 
     def var_getattr(
         self,

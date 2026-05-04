@@ -810,6 +810,9 @@ class TensorVariable(VariableTracker):
                 hints=[],
             )
 
+        if name == "__repr__" and not args and not kwargs:
+            return super().call_method(tx, name, list(args), kwargs)
+
         if name == "__deepcopy__":
             unimplemented(
                 gb_type="Attempted to copy.deepcopy a tensor",
