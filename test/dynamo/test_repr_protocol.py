@@ -21,34 +21,35 @@ class _OpaqueReprDescriptorObject:
 class TpReprTests(TestCase):
     @make_dynamo_test
     def test_int_repr(self):
-        self.assertEqual(repr(3), "3")
+        assert repr(3) == "3"  # noqa: S101
 
     @make_dynamo_test
     def test_int_dunder_repr(self):
-        self.assertEqual((3).__repr__(), "3")
+        assert (3).__repr__() == "3"  # noqa: S101
 
     @make_dynamo_test
     def test_list_repr(self):
-        self.assertEqual(repr([1, 2, 3]), "[1, 2, 3]")
+        assert repr([1, 2, 3]) == "[1, 2, 3]"  # noqa: S101
 
     @make_dynamo_test
     def test_list_dunder_repr(self):
-        self.assertEqual(list.__repr__([1, 2, 3]), "[1, 2, 3]")
+        assert list.__repr__([1, 2, 3]) == "[1, 2, 3]"  # noqa: S101
 
     @make_dynamo_test
     def test_set_repr(self):
-        self.assertEqual(repr({1, 2, 3}), "{1, 2, 3}")
+        assert repr({1, 2, 3}) == "{1, 2, 3}"  # noqa: S101
 
-    @make_dynamo_test
     def test_counter_repr(self):
-        self.assertEqual(
-            repr(collections.Counter("aba")),
-            "Counter({'a': 2, 'b': 1})",
-        )
+        def fn(x):
+            return repr(collections.Counter("aba"))
+
+        x = torch.randn(4)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(fn(x), compiled(x))
 
     @make_dynamo_test
     def test_enum_member_repr(self):
-        self.assertEqual(repr(_Color.RED), "<_Color.RED: 1>")
+        assert repr(_Color.RED) == "<_Color.RED: 1>"  # noqa: S101
 
     def test_user_defined_repr(self):
         class MyObj:
@@ -130,17 +131,14 @@ class TpReprTests(TestCase):
                 return 3
 
         def fn(x, obj):
-            try:
-                return obj.__repr__()
-            except TypeError as e:
-                return str(e)
+            return obj.__repr__()
 
         x = torch.randn(4)
         obj = BadRepr()
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
         out = compiled(x, obj)
         self.assertEqual(fn(x, obj), out)
-        self.assertIn("__repr__ returned non-string", out)
+        self.assertEqual(out, 3)
 
     def test_user_defined_opaque_repr_descriptor_raises_type_error(self):
         def fn(x, obj):
@@ -188,6 +186,7 @@ class TpReprTests(TestCase):
         x = torch.randn(4)
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(x), compiled(x))
+        self.assertEqual(compiled(x), type.__repr__(MyClass))
 
     def test_exception_repr(self):
         def fn(x):
@@ -208,45 +207,49 @@ class TpReprTests(TestCase):
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(x), compiled(x))
 
-    def test_tensor_repr_unsupported(self):
+    def test_tensor_repr(self):
         def fn(x):
             return repr(x)
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            "repr_impl not implemented",
-        ):
-            torch.compile(fn, backend="eager", fullgraph=True)(torch.randn(4))
+        x = torch.randn(4)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(
+            compiled(x),
+            "Tensor(shape=(4,), dtype=torch.float32)",
+        )
 
-    def test_tensor_dunder_repr_unsupported(self):
+    def test_tensor_dunder_repr(self):
         def fn(x):
             return x.__repr__()
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            "repr_impl not implemented",
-        ):
-            torch.compile(fn, backend="eager", fullgraph=True)(torch.randn(4))
+        x = torch.randn(4)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(
+            compiled(x),
+            "Tensor(shape=(4,), dtype=torch.float32)",
+        )
 
-    def test_list_repr_with_tensor_unsupported(self):
+    def test_list_repr_with_tensor(self):
         def fn(x):
             return repr([x])
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            r"repr\(\) on non-constant list-like",
-        ):
-            torch.compile(fn, backend="eager", fullgraph=True)(torch.randn(4))
+        x = torch.randn(4)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(
+            compiled(x),
+            "[Tensor(shape=(4,), dtype=torch.float32)]",
+        )
 
-    def test_dict_repr_with_tensor_unsupported(self):
+    def test_dict_repr_with_tensor(self):
         def fn(x):
             return repr({"x": x})
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            r"repr\(\) on non-constant dict",
-        ):
-            torch.compile(fn, backend="eager", fullgraph=True)(torch.randn(4))
+        x = torch.randn(4)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(
+            compiled(x),
+            "{'x': Tensor(shape=(4,), dtype=torch.float32)}",
+        )
 
     def test_nn_module_repr(self):
         mod = torch.nn.Sequential(torch.nn.ReLU(), torch.nn.Linear(4, 4))
@@ -266,15 +269,13 @@ class TpReprTests(TestCase):
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(x), compiled(x))
 
-    def test_dict_view_repr_with_tensor_unsupported(self):
+    def test_dict_view_repr_with_tensor(self):
         def fn(x):
             return repr({"x": x}.keys())
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            r"repr\(\) on non-constant dict view",
-        ):
-            torch.compile(fn, backend="eager", fullgraph=True)(torch.randn(4))
+        x = torch.randn(4)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(compiled(x), "dict_keys(['x'])")
 
     def test_defaultdict_repr(self):
         def fn(x):
@@ -284,18 +285,18 @@ class TpReprTests(TestCase):
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(x), compiled(x))
 
-    def test_defaultdict_repr_with_nonconstant_factory_unsupported(self):
+    def test_defaultdict_repr_with_nonconstant_factory(self):
         def fn(x):
             def factory():
                 return x
 
             return repr(collections.defaultdict(factory, {"a": 1}))
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            r"repr\(\) on non-constant defaultdict",
-        ):
-            torch.compile(fn, backend="eager", fullgraph=True)(torch.randn(4))
+        x = torch.randn(4)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        out = compiled(x)
+        self.assertIn("defaultdict(", out)
+        self.assertIn("{'a': 1}", out)
 
     def test_user_defined_dict_subclass_repr(self):
         class MyDict(dict):
@@ -308,6 +309,17 @@ class TpReprTests(TestCase):
         obj = MyDict({"a": 1})
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(x, obj), compiled(x, obj))
+
+    def test_structseq_repr(self):
+        def fn(x):
+            return repr(torch.max(x, dim=0))
+
+        x = torch.randn(3, 2)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(
+            compiled(x),
+            "torch.return_types.max(values=Tensor(shape=(2,), dtype=torch.float32), indices=Tensor(shape=(2,), dtype=torch.int64))",
+        )
 
     def test_nested_function_repr_with_tensor_closure_unsupported(self):
         def fn(x):

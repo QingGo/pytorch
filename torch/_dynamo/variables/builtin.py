@@ -366,9 +366,24 @@ class BaseBuiltinVariable(VariableTracker):
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
         if name == "__repr__" and len(args) == 1 and not kwargs:
+            arg = args[0]
+            if self.as_python_constant() is object and isinstance(
+                arg, variables.UserDefinedObjectVariable
+            ):
+                return VariableTracker.build(tx, object.__repr__(arg.value))
+            if self.as_python_constant() is type:
+                if isinstance(arg, variables.UserDefinedClassVariable):
+                    return VariableTracker.build(tx, type.__repr__(arg.value))
+                if arg.is_python_constant() and isinstance(
+                    arg.as_python_constant(), type
+                ):
+                    return VariableTracker.build(
+                        tx, type.__repr__(arg.as_python_constant())
+                    )
+
             from .object_protocol import generic_repr
 
-            return generic_repr(tx, args[0])
+            return generic_repr(tx, arg)
         return super().call_method(tx, name, args, kwargs)
 
 
@@ -1724,8 +1739,7 @@ class BuiltinVariable(BaseBuiltinVariable):
             return generic_len(tx, args[0])
 
         if name == "__repr__" and len(args) == 1 and not kwargs:
-            # type.__repr__(instance) → repr(instance)
-            return generic_repr(tx, args[0])
+            return super().call_method(tx, name, args, kwargs)
 
         if name == "__iter__" and len(args) == 1 and not kwargs:
             # type.__iter__(instance) → iter(instance)

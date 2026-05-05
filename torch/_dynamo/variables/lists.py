@@ -107,17 +107,7 @@ class BaseListVariable(VariableTracker):
         return self.python_type()([x.as_python_constant() for x in self.items])
 
     def repr_impl(self, tx: "InstructionTranslator") -> "VariableTracker":
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/listobject.c
-        try:
-            return VariableTracker.build(tx, repr(self.as_python_constant()))
-        except AsPythonConstantNotImplementedError:
-            unimplemented(
-                gb_type="repr() on non-constant list-like",
-                context=f"repr() on {type(self).__name__} with non-constant elements",
-                explanation="Dynamo could not safely evaluate repr() for this "
-                "list-like object because one or more elements are not Python constants.",
-                hints=[*graph_break_hints.SUPPORTABLE],
-            )
+        return VariableTracker.build(tx, self.debug_repr())
 
     def as_proxy(self) -> Any:
         if self.python_type() is SizeVariable:
@@ -1243,10 +1233,10 @@ class DequeVariable(CommonListMethodsVariable):
 
     def debug_repr(self) -> str:
         if self.maxlen.as_python_constant() is None:
-            return self.debug_repr_helper(
-                "deque([", "], maxlen=" + self.maxlen.debug_repr() + ")"
-            )
-        return self.debug_repr_helper("deque([", "])")
+            return self.debug_repr_helper("deque([", "])")
+        return self.debug_repr_helper(
+            "deque([", "], maxlen=" + self.maxlen.debug_repr() + ")"
+        )
 
     def as_python_constant(self) -> collections.deque[Any]:
         return self.python_type()(
@@ -1417,6 +1407,8 @@ class TupleVariable(BaseListVariable):
         return f"{self.__class__.__name__}(length={len(self.items)})"
 
     def debug_repr(self) -> str:
+        if len(self.items) == 1:
+            return self.debug_repr_helper("(", ",)")
         return self.debug_repr_helper("(", ")")
 
     def tp_iter_impl(self, tx: "InstructionTranslator") -> VariableTracker:

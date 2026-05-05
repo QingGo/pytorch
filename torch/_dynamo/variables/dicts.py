@@ -49,7 +49,6 @@ from ..utils import (
     raise_args_mismatch,
 )
 from .base import (
-    AsPythonConstantNotImplementedError,
     AttributeMutationExisting,
     AttributeMutationNew,
     NO_SUCH_SUBOBJ,
@@ -77,6 +76,12 @@ if TYPE_CHECKING:
 def pydict_check(obj: VariableTracker) -> bool:
     # This is a simplified version of the CPython's PyDict_Check function:
     return issubclass(obj.python_type(), dict)
+
+
+def _item_debug_repr(vt: VariableTracker) -> str:
+    if vt.is_python_constant():
+        return repr(vt.as_python_constant())
+    return vt.debug_repr()
 
 
 class ConstDictVariable(VariableTracker):
@@ -160,8 +165,8 @@ class ConstDictVariable(VariableTracker):
     def debug_repr(self) -> str:
         items: list[str] = []
         for k, v in self.items.items():
-            key_str = repr(k.vt.value) if hasattr(k.vt, "value") else k.vt.debug_repr()
-            val_str = repr(v.value) if hasattr(v, "value") else v.debug_repr()
+            key_str = _item_debug_repr(k.vt)
+            val_str = _item_debug_repr(v)
             items.append(f"{key_str}: {val_str}")
         return "{" + ", ".join(items) + "}"
 
@@ -172,18 +177,9 @@ class ConstDictVariable(VariableTracker):
         }
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c
-        try:
+        if self.is_python_constant():
             return VariableTracker.build(tx, repr(self.as_python_constant()))
-        except AsPythonConstantNotImplementedError:
-            unimplemented(
-                gb_type="repr() on non-constant dict",
-                context=f"repr() on {type(self).__name__} with non-constant keys or values",
-                explanation="Dynamo could not safely evaluate repr() for this "
-                "dict-like object because one or more keys or values are not "
-                "Python constants.",
-                hints=[*graph_break_hints.SUPPORTABLE],
-            )
+        return VariableTracker.build(tx, self.debug_repr())
 
     def keys_as_python_constant(self) -> dict[Any, VariableTracker]:
         self.install_dict_keys_match_guard()
@@ -992,21 +988,13 @@ class DictViewVariable(VariableTracker):
         return ConstantVariable.create(False)
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c
-        try:
+        if self.dv_dict.is_python_constant():
             d = self.dv_dict.as_python_constant()
-            assert self.kv is not None
+            if self.kv is None:
+                raise AssertionError("kv must not be None for repr_impl")
             view = getattr(d, self.kv)()
             return VariableTracker.build(tx, repr(view))
-        except AsPythonConstantNotImplementedError:
-            unimplemented(
-                gb_type="repr() on non-constant dict view",
-                context=f"repr() on {type(self).__name__} with non-constant backing dict",
-                explanation="Dynamo could not safely evaluate repr() for this "
-                "dict view because its backing dict could not be materialized as "
-                "a Python constant.",
-                hints=[*graph_break_hints.SUPPORTABLE],
-            )
+        return VariableTracker.build(tx, self.debug_repr())
 
     def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
         """Sequence length for dict view objects."""
@@ -1055,9 +1043,7 @@ class DictKeysVariable(DictViewVariable):
         else:
             items: list[str] = []
             for k in self.view_items:
-                key_str = (
-                    repr(k.vt.value) if hasattr(k.vt, "value") else k.vt.debug_repr()
-                )
+                key_str = _item_debug_repr(k.vt)
                 items.append(key_str)
             return "dict_keys([" + ", ".join(items) + "])"
 
@@ -1154,7 +1140,7 @@ class DictValuesVariable(DictViewVariable):
         else:
             items: list[str] = []
             for v in self.view_items:
-                val_str = repr(v.value) if hasattr(v, "value") else v.debug_repr()
+                val_str = _item_debug_repr(v)
                 items.append(val_str)
             return "dict_values([" + ", ".join(items) + "])"
 
@@ -1186,10 +1172,8 @@ class DictItemsVariable(DictViewVariable):
         else:
             items: list[str] = []
             for k, v in self.view_items:
-                key_str = (
-                    repr(k.vt.value) if hasattr(k.vt, "value") else k.vt.debug_repr()
-                )
-                val_str = repr(v.value) if hasattr(v, "value") else v.debug_repr()
+                key_str = _item_debug_repr(k.vt)
+                val_str = _item_debug_repr(v)
                 items.append(f"({key_str}, {val_str})")
             return "dict_items([" + ", ".join(items) + "])"
 

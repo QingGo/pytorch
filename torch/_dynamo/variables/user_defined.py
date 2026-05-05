@@ -37,7 +37,7 @@ import types
 import warnings
 import weakref
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any, TYPE_CHECKING, Union
+from typing import Any, cast, Literal, TYPE_CHECKING, Union
 from typing_extensions import is_typeddict
 
 import torch._dynamo.config
@@ -156,6 +156,12 @@ if TYPE_CHECKING:
 
     from .dicts import DunderDictVariable
     from .lists import ListVariable, TupleVariable
+
+
+def _tracked_debug_repr(vt: VariableTracker) -> str:
+    if vt.is_python_constant():
+        return repr(vt.as_python_constant())
+    return vt.debug_repr()
 
 
 def is_standard_setattr(val: object) -> bool:
@@ -3447,6 +3453,12 @@ class UserDefinedExceptionObjectVariable(UserDefinedObjectVariable):
     def fn(self) -> Callable[..., object]:
         return self.value_type
 
+    @property
+    def exc_vt(self) -> "variables.ExceptionVariable":
+        if self._base_vt is None:
+            raise AssertionError("_base_vt must not be None for exception repr")
+        return cast(variables.ExceptionVariable, self._base_vt)
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -3752,6 +3764,38 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
                 return self.call_method(tx, "__missing__", args, kwargs)
         return super().call_method(tx, name, args, kwargs)
 
+    def debug_repr(self) -> str:
+        if self._base_vt is None:
+            raise AssertionError("_base_vt must not be None for dict repr")
+        base_vt = cast(ConstDictVariable, self._base_vt)
+        if type(self.value).__repr__ is collections.Counter.__repr__:
+            items = list(base_vt.items.items())
+            try:
+                items = sorted(
+                    items,
+                    key=lambda item: item[1].as_python_constant(),
+                    reverse=True,
+                )
+            except (NotImplementedError, TypeError):
+                pass
+            if not items:
+                return f"{type(self.value).__name__}()"
+            contents = ", ".join(
+                f"{_tracked_debug_repr(key.vt)}: {_tracked_debug_repr(value)}"
+                for key, value in items
+            )
+            return f"{type(self.value).__name__}({{{contents}}})"
+        return base_vt.debug_repr()
+
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        method = self._maybe_get_baseclass_method("__repr__")
+        if (
+            method in self._base_methods
+            or type(self.value).__repr__ is collections.Counter.__repr__
+        ):
+            return VariableTracker.build(tx, self.debug_repr())
+        return super().repr_impl(tx)
+
 
 # TODO: move to dicts.py alongside ConstDictVariable and DefaultDictVariable.
 # Currently blocked by circular imports (dicts.py ↔ user_defined.py).
@@ -3796,6 +3840,21 @@ class OrderedDictVariable(UserDefinedDictVariable):
         if self._base_vt is None:
             raise AssertionError("_base_vt must not be None in as_python_constant")
         return collections.OrderedDict(self._base_vt.as_python_constant())
+
+    def debug_repr(self) -> str:
+        if self._base_vt is None:
+            raise AssertionError("_base_vt must not be None for OrderedDict repr")
+        base_vt = cast(ConstDictVariable, self._base_vt)
+        if not base_vt.items:
+            return "OrderedDict()"
+        contents = ", ".join(
+            f"({_tracked_debug_repr(key.vt)}, {_tracked_debug_repr(value)})"
+            for key, value in base_vt.items.items()
+        )
+        return f"OrderedDict([{contents}])"
+
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        return VariableTracker.build(tx, self.debug_repr())
 
     def nb_or_impl(
         self, tx: "InstructionTranslator", other: VariableTracker, reverse: bool = False
@@ -3938,13 +3997,15 @@ class DefaultDictVariable(UserDefinedDictVariable):
         )
 
     def is_python_constant(self) -> bool:
-        assert self._base_vt is not None
+        if self._base_vt is None:
+            raise AssertionError("_base_vt must not be None for defaultdict const")
         if not self.default_factory.is_python_constant():
             return False
         return self._base_vt.is_python_constant()
 
     def as_python_constant(self) -> Any:
-        assert self._base_vt is not None
+        if self._base_vt is None:
+            raise AssertionError("_base_vt must not be None for defaultdict const")
         if not self.default_factory.is_python_constant():
             raise AsPythonConstantNotImplementedError(
                 self,
@@ -3964,19 +4025,9 @@ class DefaultDictVariable(UserDefinedDictVariable):
         )
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Modules/_collectionsmodule.c
-        try:
+        if self.is_python_constant():
             return VariableTracker.build(tx, repr(self.as_python_constant()))
-        except AsPythonConstantNotImplementedError:
-            unimplemented(
-                gb_type="repr() on non-constant defaultdict",
-                context="repr() on defaultdict with non-constant default_factory "
-                "or values",
-                explanation="Dynamo could not safely evaluate repr() for this "
-                "defaultdict because its default_factory or contents are not "
-                "Python constants.",
-                hints=[*graph_break_hints.SUPPORTABLE],
-            )
+        return VariableTracker.build(tx, self.debug_repr())
 
     def var_getattr(
         self,
@@ -4536,6 +4587,17 @@ class StructSequenceVariable(UserDefinedTupleVariable):
     def as_proxy(self) -> Any:
         items = [x.as_proxy() for x in self.items]
         return self.tuple_cls(items)
+
+    def debug_repr(self) -> str:
+        fields = namedtuple_fields(self.tuple_cls)
+        items = ", ".join(
+            f"{name}={_tracked_debug_repr(item)}"
+            for name, item in zip(fields, self.items)
+        )
+        return f"{self.tuple_cls.__module__}.{self.tuple_cls.__qualname__}({items})"
+
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        return VariableTracker.build(tx, self.debug_repr())
 
 
 class MutableMappingVariable(UserDefinedObjectVariable):

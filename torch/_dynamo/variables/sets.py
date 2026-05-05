@@ -52,6 +52,12 @@ def pyset_check(obj: VariableTracker) -> bool:
     return issubclass(obj.python_type(), set)
 
 
+def _item_debug_repr(vt: VariableTracker) -> str:
+    if vt.is_python_constant():
+        return repr(vt.as_python_constant())
+    return vt.debug_repr()
+
+
 class SetVariable(VariableTracker):
     """Represents a Python set during symbolic execution."""
 
@@ -103,9 +109,9 @@ class SetVariable(VariableTracker):
             items: list[str] = []
             for v in self.items:
                 vt = v.vt if isinstance(v, HashableTracker) else v
-                val_str = repr(vt.value) if hasattr(vt, "value") else vt.debug_repr()
+                val_str = _item_debug_repr(vt)
                 items.append(val_str)
-            return "{" + ",".join(items) + "}"
+            return "{" + ", ".join(items) + "}"
 
     @property
     def set_items(self) -> set["HashableTracker"]:
@@ -126,17 +132,9 @@ class SetVariable(VariableTracker):
         return {k.vt.as_python_constant() for k in self.set_items}
 
     def repr_impl(self, tx: "InstructionTranslator") -> "VariableTracker":
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/setobject.c
-        try:
+        if self.is_python_constant():
             return VariableTracker.build(tx, repr(self.as_python_constant()))
-        except AsPythonConstantNotImplementedError:
-            unimplemented(
-                gb_type="repr() on non-constant set",
-                context=f"repr() on {type(self).__name__} with non-constant elements",
-                explanation="Dynamo could not safely evaluate repr() for this "
-                "set because one or more elements are not Python constants.",
-                hints=[*graph_break_hints.SUPPORTABLE],
-            )
+        return VariableTracker.build(tx, self.debug_repr())
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         codegen.foreach([x.vt for x in self.set_items])
@@ -713,11 +711,9 @@ class OrderedSetVariable(SetVariable):
         else:
             items: list[str] = []
             for k in self.items:
-                key_str = (
-                    repr(k.vt.value) if hasattr(k.vt, "value") else k.vt.debug_repr()
-                )
+                key_str = _item_debug_repr(k.vt)
                 items.append(key_str)
-            return "OrderedSet([" + ",".join(items) + "])"
+            return "OrderedSet([" + ", ".join(items) + "])"
 
     def as_python_constant(self) -> OrderedSet[Any]:
         return OrderedSet([k.vt.as_python_constant() for k in self.set_items])
@@ -755,11 +751,9 @@ class FrozensetVariable(SetVariable):
         else:
             items: list[str] = []
             for k in self.items:
-                key_str = (
-                    repr(k.vt.value) if hasattr(k.vt, "value") else k.vt.debug_repr()
-                )
+                key_str = _item_debug_repr(k.vt)
                 items.append(key_str)
-            return "{" + ",".join(items) + "}"
+            return "frozenset({" + ", ".join(items) + "})"
 
     @property
     def set_items(self) -> set["HashableTracker"]:
@@ -845,11 +839,9 @@ class DictKeySetVariable(SetVariable):
         else:
             items: list[str] = []
             for k in self.items:
-                key_str = (
-                    repr(k.vt.value) if hasattr(k.vt, "value") else k.vt.debug_repr()
-                )
+                key_str = _item_debug_repr(k.vt)
                 items.append(key_str)
-            return "dict_keys([" + ",".join(items) + "])"
+            return "dict_keys([" + ", ".join(items) + "])"
 
     def install_set_contains_guard(
         self, tx: "InstructionTranslator", args: list[VariableTracker]

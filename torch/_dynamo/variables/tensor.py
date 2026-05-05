@@ -268,8 +268,14 @@ class TensorVariable(VariableTracker):
             tx.output.check_input_mutation_on_current_stream(tx)
 
     def debug_repr(self) -> str:
-        # TODO: strip off fake tensor from repr here
-        return repr(self.proxy.node.meta["example_value"])
+        example_value = self.proxy.node.meta["example_value"]
+        return (
+            f"{self.python_type_name()}(shape={tuple(example_value.shape)}, "
+            f"dtype={example_value.dtype})"
+        )
+
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        return VariableTracker.build(tx, self.debug_repr())
 
     def as_proxy(self) -> torch.fx.Proxy:
         return self.proxy
