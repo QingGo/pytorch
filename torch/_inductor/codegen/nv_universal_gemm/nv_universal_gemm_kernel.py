@@ -192,17 +192,39 @@ class NVUniversalGemmKernel(Kernel):
                         accumulator_type={acc_dtype_str},
                     )"""
 
+        # Build variant-specific precompile tensor creation code
+        precompile_tensors = []
+        for i, _ in enumerate(self.input_nodes):
+            ptr_name = f"in_ptr{i}"
+            precompile_tensors.append(
+                f"{ptr_name} = torch.empty("
+                f'tuple(precompile_shapes["{ptr_name}"]), '
+                f"device=device, "
+                f'dtype=getattr(torch, precompile_dtypes["{ptr_name}"]))'
+            )
+        precompile_tensors.append(
+            "out_ptr0 = torch.empty("
+            'tuple(precompile_shapes["output"]), '
+            "device=device, "
+            'dtype=getattr(torch, precompile_dtypes["output"]))'
+        )
+        precompile_tensor_code = "\n                ".join(precompile_tensors)
+
         code = IndentedBuffer()
         code.splice(
             f"""
+            import torch
             import cutlass
             import cutlass_api
+            from cutlass_api.artifact import CompiledArtifact
             from torch._inductor.codegen.nv_universal_gemm.kernel_cache import get_kernel_by_name
+            from torch._inductor.runtime.cutedsl_cache import disk_cache_get, disk_cache_set
             {extra_imports}
 
             {kernel_name_var} = "{kernel_name_str}"
-            # Maps (shape, dtype, shape, dtype, ...) -> compiled kernel artifact
+            _DISK_CACHE_CONFIG_KEY = ({kernel_name_var},)
             {cache_var} = {{}}
+            _disk_fn_cache = {{}}
 
             def {self.kernel_name}_main({params_str}):
                 global {cache_var}
@@ -213,13 +235,49 @@ class NVUniversalGemmKernel(Kernel):
 
                 {create_args_code}
 
+                dev_idx = in_ptr0.device.index or 0
                 cache_key = {cache_key_code}
-                artifact = {cache_var}.get(cache_key)
+                mem_key = (cache_key, dev_idx)
+                artifact = {cache_var}.get(mem_key)
                 if artifact is None:
-                    artifact = kernel.compile(args)
-                    {cache_var}[cache_key] = artifact
+                    compiled_fn = disk_cache_get(
+                        _disk_fn_cache, __file__, _DISK_CACHE_CONFIG_KEY,
+                        cache_key, dev_idx,
+                    )
+                    if compiled_fn is not None:
+                        artifact = CompiledArtifact(compiled_fn, kernel)
+                    else:
+                        artifact = kernel.compile(args)
+                        disk_cache_set(
+                            _disk_fn_cache, __file__, _DISK_CACHE_CONFIG_KEY,
+                            cache_key, artifact.compiled_obj, dev_idx,
+                        )
+                    {cache_var}[mem_key] = artifact
 
                 kernel.run(args, artifact, stream=stream, workspace={workspace_arg}, assume_supported_args=True)
+
+            def {self.kernel_name}_precompile(precompile_shapes, precompile_dtypes, device_index=0):
+                global {cache_var}
+                torch.cuda.set_device(device_index)
+                device = f"cuda:{{device_index}}"
+
+                {precompile_tensor_code}
+
+                kernel = get_kernel_by_name({kernel_name_var})
+                if kernel is None:
+                    return
+
+                {create_args_code}
+
+                cache_key = {cache_key_code}
+                mem_key = (cache_key, device_index)
+                if mem_key not in {cache_var}:
+                    artifact = kernel.compile(args)
+                    disk_cache_set(
+                        _disk_fn_cache, __file__, _DISK_CACHE_CONFIG_KEY,
+                        cache_key, artifact.compiled_obj, device_index,
+                    )
+                    {cache_var}[mem_key] = artifact
             """
         )
 
