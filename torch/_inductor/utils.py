@@ -2312,15 +2312,31 @@ def use_decompose_k_choice(
 
     decompose_k_threshold = config.triton.decompose_k_threshold * threshold_multiple
 
-    return (
-        V.graph.sizevars.statically_known_true(
+    threshold_expr = sympy.And(
+        sympy.Ge(k, decompose_k_threshold * m),
+        sympy.Ge(k, decompose_k_threshold * n),
+    )
+    # When m or n are symbolic (e.g. dynamic batch dim), the static proof
+    # fails even though sample-input shapes satisfy it.  Fall back to the
+    # concrete hint values so decompose_k is still offered as a candidate.
+    if not V.graph.sizevars.statically_known_true(threshold_expr):
+        m_h = V.graph.sizevars.replace_backed_symbols_with_hints(m)
+        n_h = V.graph.sizevars.replace_backed_symbols_with_hints(n)
+        k_h = V.graph.sizevars.replace_backed_symbols_with_hints(k)
+        threshold_ok = V.graph.sizevars.statically_known_true(
             sympy.And(
-                sympy.Ge(k, decompose_k_threshold * m),
-                sympy.Ge(k, decompose_k_threshold * n),
+                sympy.Ge(k_h, decompose_k_threshold * m_h),
+                sympy.Ge(k_h, decompose_k_threshold * n_h),
             )
         )
-        and not V.graph.aot_mode  # TODO: Support AOTI for decomposeK
-        and not V.graph.cpp_wrapper
+    else:
+        threshold_ok = True
+
+    aoti_supported = bool(torch.version.hip)
+    return (
+        threshold_ok
+        and (aoti_supported or not V.graph.aot_mode)
+        and (aoti_supported or not V.graph.cpp_wrapper)
         and config.triton.num_decompose_k_splits > 0
     )
 

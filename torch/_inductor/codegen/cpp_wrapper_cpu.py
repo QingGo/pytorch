@@ -735,7 +735,13 @@ class CppWrapperCpu(PythonWrapperCodegen):
                         )
 
         # Create a separate function for each input check to avoid "too big to optimize" error
+        # Skip non-tensor inputs (e.g. sympy.Expr for symbolic shapes) since
+        # they don't have dtype/size/stride attributes.
+        tensor_input_indices = []
         for idx, (name, tensor) in enumerate(V.graph.graph_inputs.items()):
+            if not isinstance(tensor, ir.TensorBox):
+                continue
+            tensor_input_indices.append(idx)
             self.prefix.splice(
                 f"""
                 AOTI_NOINLINE static void check_input_{idx}(
@@ -766,7 +772,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
             """
         )
         with self.prefix.indent():
-            for idx in range(len(V.graph.graph_inputs)):
+            for idx in tensor_input_indices:
                 self.prefix.writeline(f"check_input_{idx}(input_handles);")
         self.prefix.writeline("}")
 
@@ -1066,9 +1072,6 @@ class CppWrapperCpu(PythonWrapperCodegen):
 
         with self.prefix.indent():
             for idx, (name, inp) in enumerate(V.graph.graph_inputs.items()):
-                assert not isinstance(inp, sympy.Expr), (
-                    f"input {name=} cannot be symbolic"
-                )
                 self.write_input_output_info("inputs_info_", idx, name)
 
             all_cuda = all(
@@ -2383,6 +2386,9 @@ class CppWrapperCpu(PythonWrapperCodegen):
                 # before (e.g., in the while_loop codegen)
                 self.writeline(f"{outer_output}.reset();")
             self.writeline(f"{outer_output} = {src};")
+
+    def codegen_subgraph_buffer(self, subgraph, outer_inputs, outer_outputs):
+        self.codegen_subgraph(subgraph, outer_inputs, outer_outputs)
 
     def codegen_invoke_subgraph(self, invoke_subgraph):
         raise NotImplementedError(

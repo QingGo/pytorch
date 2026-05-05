@@ -186,12 +186,17 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         log.debug("Benchmark compile %s: sym_inputs=%s", self.name, self.sym_inputs)
 
         assert self.gm is not None
+        # The benchmark graph uses Python wrapper (not cpp_wrapper / aot_mode)
+        # regardless of the parent graph.  The benchmark only needs a callable
+        # module to time the subgraph; it does not need AOTI-compatible C++
+        # codegen, which would generate an unimportable .py file containing
+        # raw C++ source.
         bm_graph_lowering = GraphLowering(
             gm=self.gm,
             example_inputs=compile_inputs,
             shape_env=V.graph._shape_env,
-            cpp_wrapper=V.graph.cpp_wrapper,
-            aot_mode=V.graph.aot_mode,
+            cpp_wrapper=False,
+            aot_mode=False,
             extern_node_serializer=V.graph.extern_node_serializer,
             is_inference=V.graph.is_inference,
             is_backward=V.graph.is_backward,
@@ -204,13 +209,21 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
 
         with V.set_graph_handler(bm_graph_lowering):
             # Apply config_patches during benchmarking (e.g., coordinate_descent_tuning)
-            # Also disable max_autotune to avoid nested autotuning
+            # Also disable max_autotune to avoid nested autotuning.
+            # On AMD/HIP only use Triton
+            # On NVIDIA, hard coded to ATen always
             benchmark_config: dict[str, Any] = {
                 "max_autotune": False,
-                "max_autotune_gemm": False,
-                "max_autotune_gemm_backends": "ATEN",
+                "max_autotune_gemm": bool(torch.version.hip),
+                "max_autotune_gemm_backends": "TRITON" if torch.version.hip else "ATEN",
+                **({"triton.num_decompose_k_splits": 0} if torch.version.hip else {}),
                 "benchmark_fusion": False,
                 "pipeline_max_autotune_gemm": False,
+                # _update_scheduler patches store_cubin=False to avoid biasing
+                # the parent's benchmarks, but when the subgraph itself is
+                # compiled with cpp_wrapper the cubins must be stored so the
+                # C++ wrapper codegen can find them in CudaKernelParamCache.
+                "triton.store_cubin": V.graph.cpp_wrapper,
                 **self.config_patches,
             }
             with config.patch(benchmark_config):

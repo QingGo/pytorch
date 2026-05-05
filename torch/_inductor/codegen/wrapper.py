@@ -4071,6 +4071,14 @@ class PythonWrapperCodegen(CodeGen):
         self.codegen_subgraph_common(subgraph)
         self.codegen_subgraph_call(subgraph, outer_inputs, outer_buffer_name)
 
+    def codegen_subgraph_buffer(self, subgraph, outer_inputs, outer_outputs):
+        if V.graph.aot_mode:
+            self.codegen_subgraph_by_inlining(subgraph, outer_inputs, outer_outputs)
+        else:
+            self.codegen_subgraph_with_flattened_outputs(
+                subgraph, outer_inputs, outer_outputs
+            )
+
     def codegen_invoke_subgraph(self, invoke_subgraph):
         name = invoke_subgraph.get_name()
 
