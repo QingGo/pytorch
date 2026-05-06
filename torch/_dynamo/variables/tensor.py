@@ -147,6 +147,32 @@ def is_bound_tensor_method(value: object) -> bool:
 all_tensor_attrs = torch._C.TensorBase.__dict__ | torch.Tensor.__dict__
 
 
+def _tensor_debug_repr(value: torch.Tensor, type_name: str = "Tensor") -> str:
+    try:
+        if torch._C._functorch.is_batchedtensor(value):
+            level = torch._C._functorch.maybe_get_level(value)
+            bdim = torch._C._functorch.maybe_get_bdim(value)
+            unwrapped = torch._C._functorch.get_unwrapped(value)
+            return (
+                "BatchedTensor("
+                f"lvl={level}, bdim={bdim}, value={_tensor_debug_repr(unwrapped)}"
+                ")"
+            )
+        if torch._C._functorch.is_gradtrackingtensor(value):
+            level = torch._C._functorch.maybe_get_level(value)
+            unwrapped = torch._C._functorch.get_unwrapped(value)
+            return f"GradTrackingTensor(lvl={level}, value={_tensor_debug_repr(unwrapped)})"
+        if torch._C._functorch.is_functionaltensor(value):
+            level = torch._C._functorch.maybe_get_level(value)
+            unwrapped = torch._C._functorch.get_unwrapped(value)
+            return (
+                f"FunctionalTensor(lvl={level}, value={_tensor_debug_repr(unwrapped)})"
+            )
+    except Exception:
+        pass
+    return f"{type_name}(shape={tuple(value.shape)}, dtype={value.dtype})"
+
+
 class TensorVariable(VariableTracker):
     """A torch.Tensor input or an intermediate value in the FX graph"""
 
@@ -268,10 +294,8 @@ class TensorVariable(VariableTracker):
             tx.output.check_input_mutation_on_current_stream(tx)
 
     def debug_repr(self) -> str:
-        example_value = self.proxy.node.meta["example_value"]
-        return (
-            f"{self.python_type_name()}(shape={tuple(example_value.shape)}, "
-            f"dtype={example_value.dtype})"
+        return _tensor_debug_repr(
+            self.proxy.node.meta["example_value"], self.python_type_name()
         )
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
