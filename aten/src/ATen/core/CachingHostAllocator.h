@@ -2,13 +2,17 @@
 
 #include <c10/core/Allocator.h>
 #include <c10/core/AllocatorConfig.h>
+#include <c10/core/CachingDeviceAllocator.h>
+#include <c10/core/RingBuffer.h>
 #include <c10/core/Stream.h>
 #include <c10/core/thread_pool.h>
+#include <c10/util/ApproximateClock.h>
 #include <c10/util/flat_hash_map.h>
 #include <c10/util/llvmMathExtras.h>
 #include <iostream>
 #include <optional>
 
+#include <atomic>
 #include <deque>
 #include <vector>
 #include <mutex>
@@ -40,6 +44,7 @@ struct HostBlock {
   ska::flat_hash_set<S> streams_; // streams on which the block was used
   c10::MempoolId_t owning_pool_{0,0}; // never changes after construction, so we don't need a mutex to guard this
   bool was_allocated_during_stream_capture_;
+  std::shared_ptr<c10::GatheredContext> context_when_allocated_;
 };
 
 template <typename B>
@@ -167,6 +172,15 @@ struct alignas(hardware_destructive_interference_size) HostStatsStaged {
  * never do any possible expensive operations (such as CUDA runtime API calls)
  * while holding the lock.
  *
+ * Lock ordering (outer to inner):
+ *   instance_mutex_ > pool.blocks_mutex_ > pool.free_list_[i].mutex_
+ *                                        > block->mutex_
+ *                                                                    > alloc_trace_lock (RingBuffer)
+ * events_mutex_ is independent: never held together with the above.
+ * Profiling state (record_history_, context_recorder_, record_context_) is
+ * not protected by a mutex; it relies on being written only from Python
+ * under the GIL and not concurrently with allocate()/free().
+ *
  * There are four public methods: allocate, free, record_event and empty_cache.
  *   1) In the allocate path, we first check to see if we can service our
  * request from this free list, and otherwise we create a new block with
@@ -269,6 +283,11 @@ struct CachingHostAllocatorImpl {
 
   using BlockPool = HostBlockPool<S, E, B>;
   using PrivatePool = HostPrivatePool<S, E, B>;
+  using TraceEntry = c10::CachingDeviceAllocator::TraceEntry;
+  using RecordContext = c10::CachingDeviceAllocator::RecordContext;
+  using CreateContextFn = c10::CachingDeviceAllocator::CreateContextFn;
+  using SegmentInfo = c10::CachingDeviceAllocator::SegmentInfo;
+  using BlockInfo = c10::CachingDeviceAllocator::BlockInfo;
 
   virtual ~CachingHostAllocatorImpl() {
     if (active_) {
@@ -282,6 +301,11 @@ struct CachingHostAllocatorImpl {
     if (size == 0) {
       return {nullptr, nullptr};
     }
+
+    // Gather context before acquiring the pinned memory allocator's
+    // blocks_mutex_ to avoid holding it during potential GIL acquisition.
+    auto context = maybeGatherContext(
+        c10::CachingDeviceAllocator::RecordContext::STATE);
 
     auto&& [mempool_id, pool] = get_allocation_pool_for_current_stream();
 
@@ -311,6 +335,14 @@ struct CachingHostAllocatorImpl {
     auto* block = get_free_block(roundSize, pool);
     if (block) {
       block->was_allocated_during_stream_capture_ = current_stream_is_capturing_fast_path();
+      block->context_when_allocated_ = context;
+      record_trace(
+          TraceEntry::ALLOC,
+          reinterpret_cast<size_t>(block->ptr_),
+          block->size_,
+          nullptr,
+          mempool_id,
+          std::move(context));
       return {block->ptr_, reinterpret_cast<void*>(block)};
     }
 
@@ -339,12 +371,29 @@ struct CachingHostAllocatorImpl {
     void* ptr = nullptr;
     allocate_host_memory(roundSize, &ptr);
 
+    record_trace(
+        TraceEntry::SEGMENT_ALLOC,
+        reinterpret_cast<size_t>(ptr),
+        roundSize,
+        nullptr,
+        mempool_id,
+        nullptr);
+
     // Then, create a new block.
     block = new B(roundSize, ptr);
     block->allocated_ = true;
     block->owning_pool_ = mempool_id;
     block->was_allocated_during_stream_capture_ = current_stream_is_capturing_fast_path();
+    block->context_when_allocated_ = context;
     add_allocated_block(block, pool);
+
+    record_trace(
+        TraceEntry::ALLOC,
+        reinterpret_cast<size_t>(block->ptr_),
+        block->size_,
+        nullptr,
+        mempool_id,
+        std::move(context));
     return {block->ptr_, reinterpret_cast<void*>(block)};
   }
 
@@ -356,6 +405,17 @@ struct CachingHostAllocatorImpl {
     // Note: we can assume that free is correctly paired with alloc, and thus we
     // do not need to look up the ctx in blocks_.
     auto* block = reinterpret_cast<B*>(ctx);
+
+    auto context = maybeGatherContext(
+        c10::CachingDeviceAllocator::RecordContext::ALL);
+
+    record_trace(
+        TraceEntry::FREE_REQUESTED,
+        reinterpret_cast<size_t>(block->ptr_),
+        block->size_,
+        nullptr,
+        block->owning_pool_,
+        std::move(context));
 
     std::optional<std::vector<E>> events;
     ska::flat_hash_set<S> streams;
@@ -731,6 +791,18 @@ struct CachingHostAllocatorImpl {
   }
 
   void maybe_cache_block(B* block, BlockPool& pool) {
+    if (C10_UNLIKELY(record_history_)) {
+      std::lock_guard<std::mutex> g(block->mutex_);
+      record_trace(
+          TraceEntry::FREE_COMPLETED,
+          reinterpret_cast<size_t>(block->ptr_),
+          block->size_,
+          nullptr,
+          block->owning_pool_,
+          block->context_when_allocated_);
+      block->context_when_allocated_.reset();
+    }
+
     auto size = block->size_;
     auto index = size_index(size);
 
@@ -754,10 +826,14 @@ struct CachingHostAllocatorImpl {
   void destroy_block(B* block, BlockPool& pool, bool is_active) {
     auto size = block->size_;
     auto index = size_index(size);
+    auto ptr = reinterpret_cast<size_t>(block->ptr_);
+    auto mempool_id = block->owning_pool_;
 
     pool.blocks_.erase(block);
     pool.ptr_to_block_.erase(block->ptr_);
     free_block(block);
+
+    record_trace(TraceEntry::SEGMENT_FREE, ptr, size, nullptr, mempool_id, nullptr);
 
     stats_.allocations.decrease(1);
     stats_.allocated_bytes.decrease(size);
@@ -961,6 +1037,116 @@ private:
     TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for stream_is_capturing");
   }
 
+  std::shared_ptr<c10::GatheredContext> maybeGatherContext(
+      RecordContext level) {
+    if (record_context_ < level) {
+      return nullptr;
+    }
+    return context_recorder_();
+  }
+
+  void record_trace(
+      TraceEntry::Action action,
+      size_t addr,
+      size_t size,
+      void* stream_ptr,
+      c10::MempoolId_t mempool_id,
+      std::shared_ptr<c10::GatheredContext> context) {
+    if (C10_LIKELY(!record_history_)) {
+      return;
+    }
+    TraceEntry te(
+        action,
+        /*device=*/-1,
+        addr,
+        size,
+        stream_ptr,
+        mempool_id,
+        c10::getApproximateTime(),
+        record_context_ >= RecordContext::ALLOC ? std::move(context)
+                                                : nullptr);
+    trace_buffer_.insertEntries(te);
+  }
+
+ public:
+  void recordHistory(
+      bool enabled,
+      CreateContextFn context_recorder,
+      size_t max_entries,
+      RecordContext when,
+      bool clearHistory) {
+    record_history_ = enabled;
+    if (enabled) {
+      context_recorder_ = context_recorder;
+      record_context_ = when;
+      trace_buffer_.setMaxEntries(max_entries);
+    } else {
+      context_recorder_ = nullptr;
+      record_context_ = RecordContext::NEVER;
+    }
+    if (clearHistory) {
+      trace_buffer_.clear();
+    }
+  }
+
+  bool isHistoryEnabled() const {
+    return record_history_;
+  }
+
+  std::vector<TraceEntry> getTraces() {
+    auto tsc_to_ns = clock_converter_.makeConverter();
+    auto tsc_to_us = [=](c10::approx_time_t t_approx) {
+      return tsc_to_ns(t_approx) / 1000;
+    };
+    std::vector<TraceEntry> result;
+    trace_buffer_.getEntries(result);
+    for (auto& te : result) {
+      te.time_.t_ = tsc_to_us(te.time_.approx_t_);
+    }
+    return result;
+  }
+
+  std::vector<SegmentInfo> getSegments() {
+    std::vector<SegmentInfo> result;
+    auto collect_from_pool = [&](BlockPool& pool) {
+      std::lock_guard<std::mutex> g(pool.blocks_mutex_);
+      for (auto* block : pool.blocks_) {
+        SegmentInfo seg;
+        seg.device = -1;
+        seg.address = reinterpret_cast<size_t>(block->ptr_);
+        seg.total_size = block->size_;
+        seg.stream = nullptr;
+        seg.is_large = false;
+        seg.is_expandable = false;
+        seg.owner_private_pool_id = block->owning_pool_;
+
+        BlockInfo bi;
+        bi.size = block->size_;
+        bi.requested_size = block->size_;
+        {
+          std::lock_guard<std::mutex> gb(block->mutex_);
+          bi.allocated = block->allocated_;
+          bi.active = block->allocated_ || (block->event_count_ > 0);
+          bi.context_when_allocated = block->context_when_allocated_;
+          seg.allocated_size = block->allocated_ ? block->size_ : 0;
+          seg.active_size = bi.active ? block->size_ : 0;
+        }
+        seg.blocks.push_back(std::move(bi));
+        result.push_back(std::move(seg));
+      }
+    };
+    collect_from_pool(default_pool_);
+    {
+      std::shared_lock<std::shared_mutex> lg(instance_mutex_);
+      for (auto& [_, private_pool] : graph_pools_) {
+        collect_from_pool(private_pool->blocks);
+      }
+    }
+    return result;
+  }
+
+ private:
+
   // instance variables
 
   // instance_mutex_ protects graphs_pools_, graph_pools_freeable_,
@@ -999,6 +1185,17 @@ private:
   // Indicates whether the event-processing thread pool is active.
   // Set to false in the destructor to signal background threads to stop.
   std::atomic<bool> active_{false};
+
+  // Memory profiling state.
+  // Like CUDA's DeviceCachingAllocator, these are protected by the
+  // assumption that recordHistory() is called from Python (under the GIL)
+  // and not concurrently with allocate()/free().
+  bool record_history_{false};
+  CreateContextFn context_recorder_{nullptr};
+  RecordContext record_context_{RecordContext::NEVER};
+  c10::RingBuffer<TraceEntry> trace_buffer_;
+  c10::ApproximateClockToUnixTimeConverter clock_converter_;
+
 protected:
   alignas(hardware_destructive_interference_size) HostStatsStaged stats_;
 };
@@ -1035,6 +1232,25 @@ struct TORCH_API HostAllocator : public at::Allocator {
 
   virtual void release_pool(c10::MempoolId_t pool_id) {
     TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for release_pool");
+  }
+
+  virtual void record_history(
+      bool enabled,
+      c10::CachingDeviceAllocator::CreateContextFn context_recorder,
+      size_t max_entries,
+      c10::CachingDeviceAllocator::RecordContext when,
+      bool clearHistory) {}
+
+  virtual bool is_history_enabled() const {
+    return false;
+  }
+
+  virtual std::vector<c10::CachingDeviceAllocator::SegmentInfo> get_segments() {
+    return {};
+  }
+
+  virtual std::vector<c10::CachingDeviceAllocator::TraceEntry> get_traces() {
+    return {};
   }
 };
 
@@ -1092,6 +1308,29 @@ struct CachingHostAllocatorInterface : public HostAllocator {
 
   void release_pool(c10::MempoolId_t pool_id) override {
     impl_->release_pool(pool_id);
+  }
+
+  void record_history(
+      bool enabled,
+      c10::CachingDeviceAllocator::CreateContextFn context_recorder,
+      size_t max_entries,
+      c10::CachingDeviceAllocator::RecordContext when,
+      bool clearHistory) override {
+    impl_->recordHistory(enabled, context_recorder, max_entries, when,
+                         clearHistory);
+  }
+
+  bool is_history_enabled() const override {
+    return impl_->isHistoryEnabled();
+  }
+
+  std::vector<c10::CachingDeviceAllocator::SegmentInfo> get_segments()
+      override {
+    return impl_->getSegments();
+  }
+
+  std::vector<c10::CachingDeviceAllocator::TraceEntry> get_traces() override {
+    return impl_->getTraces();
   }
 
   std::unique_ptr<T> impl_;

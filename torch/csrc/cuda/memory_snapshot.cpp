@@ -1,6 +1,8 @@
 #include <ATen/Context.h>
+#include <ATen/core/CachingHostAllocator.h>
 #include <ATen/record_function.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/util/ApproximateClock.h>
 #include <c10/util/Exception.h>
 #include <torch/csrc/cuda/memory_snapshot.h>
 #include <torch/csrc/jit/runtime/interpreter.h>
@@ -200,7 +202,11 @@ void _record_memory_history(
     bool clearHistory,
     bool compileContext,
     bool globalRecordAnnotations,
-    const std::vector<std::string>& skip_actions) {
+    const std::vector<std::string>& skip_actions,
+    bool record_host) {
+  TORCH_CHECK(
+      !record_host || enabled,
+      "record_host requires memory history recording to be enabled");
   c10::CachingDeviceAllocator::CreateContextFn recorder = gather;
   if (enabled && record_cpp_context &&
       (trace_alloc_record_context || record_context)) {
@@ -224,6 +230,13 @@ void _record_memory_history(
       when,
       clearHistory,
       skip_actions);
+
+  bool host_enabled = enabled && record_host;
+  auto* host_alloc = at::getHostAllocator(at::kCUDA);
+  if (host_alloc && (host_enabled || host_alloc->is_history_enabled())) {
+    host_alloc->record_history(
+        host_enabled, recorder, trace_alloc_max_entries, when, clearHistory);
+  }
 }
 
 static void checkOptionIn(
@@ -242,7 +255,11 @@ void _record_memory_history(
     bool clearHistory,
     bool compileContext,
     bool globalRecordAnnotations,
-    const std::vector<std::string>& skip_actions) {
+    const std::vector<std::string>& skip_actions,
+    bool record_host) {
+  TORCH_CHECK(
+      !record_host || enabled.has_value(),
+      "record_host requires memory history recording to be enabled");
   if (enabled) {
     checkOptionIn(
         *enabled,
@@ -285,6 +302,13 @@ void _record_memory_history(
       when,
       clearHistory,
       skip_actions);
+
+  bool host_enabled = enabled.has_value() && record_host;
+  auto* host_alloc = at::getHostAllocator(at::kCUDA);
+  if (host_alloc && (host_enabled || host_alloc->is_history_enabled())) {
+    host_alloc->record_history(
+        host_enabled, recorder, max_entries, when, clearHistory);
+  }
 }
 
 std::string _memory_snapshot_pickled() {
@@ -422,26 +446,30 @@ std::string _memory_snapshot_pickled() {
     TORCH_CHECK(false, "unreachable");
   };
 
+  auto traceEntryToDict = [&](const TraceEntry& te) {
+    auto trace_entry = new_dict();
+    trace_entry.insert(action_s, action_to_str(te.action_));
+    trace_entry.insert(
+        TraceEntry::OOM == te.action_ ? device_free_s : addr_s,
+        static_cast<int64_t>(te.addr_));
+    trace_entry.insert(size_s, (int64_t)te.size_);
+    trace_entry.insert(stream_s, int64_t(te.stream_));
+    trace_entry.insert(compile_contexts_s, te.compile_context_);
+    trace_entry.insert(user_metadata_s, te.user_metadata_);
+    if (te.context_) {
+      auto sc = getCapturedTracebackFromContext(te.context_);
+      frame_tracebacks.push_back(sc);
+      frame_dict.push_back(trace_entry);
+    }
+    trace_entry.insert(time_us_s, te.time_.t_);
+    trace_entry.insert(pool_id_s, std::tuple<int64_t, int64_t>(te.mempool_));
+    return trace_entry;
+  };
+
   for (const auto& traceInfo : snapshot.device_traces) {
     auto trace = new_list();
     for (const auto& te : traceInfo) {
-      auto trace_entry = new_dict();
-      trace_entry.insert(action_s, action_to_str(te.action_));
-      trace_entry.insert(
-          TraceEntry::OOM == te.action_ ? device_free_s : addr_s,
-          static_cast<int64_t>(te.addr_));
-      trace_entry.insert(size_s, (int64_t)te.size_);
-      trace_entry.insert(stream_s, int64_t(te.stream_));
-      trace_entry.insert(compile_contexts_s, te.compile_context_);
-      trace_entry.insert(user_metadata_s, te.user_metadata_);
-      if (te.context_) {
-        auto sc = getCapturedTracebackFromContext(te.context_);
-        frame_tracebacks.push_back(sc);
-        frame_dict.push_back(trace_entry);
-      }
-      trace_entry.insert(time_us_s, te.time_.t_);
-      trace_entry.insert(pool_id_s, std::tuple<int64_t, int64_t>(te.mempool_));
-      trace.push_back(trace_entry);
+      trace.push_back(traceEntryToDict(te));
     }
     traces.push_back(trace);
   }
@@ -507,11 +535,30 @@ std::string _memory_snapshot_pickled() {
   }
   allocator_settings.insert(roundup_power2_divisions_s, roundup_settings);
 
+  // Collect host allocator data
+  auto* host_alloc = at::getHostAllocator(at::kCUDA);
+  if (host_alloc && host_alloc->is_history_enabled()) {
+    snapshot.host_traces = host_alloc->get_traces();
+    snapshot.host_segments = host_alloc->get_segments();
+  }
+
+  auto host_segments = new_list();
+  for (const auto& segmentInfo : snapshot.host_segments) {
+    host_segments.push_back(segmentInfoToDict(segmentInfo));
+  }
+
+  auto host_traces = new_list();
+  for (const auto& te : snapshot.host_traces) {
+    host_traces.push_back(traceEntryToDict(te));
+  }
+
   auto result = new_dict();
   result.insert("segments", segments);
   result.insert("device_traces", traces);
   result.insert("allocator_settings", allocator_settings);
   result.insert("external_annotations", external_annotations);
+  result.insert("host_segments", host_segments);
+  result.insert("host_traces", host_traces);
 
   auto frames = ivalue_symbolize(frame_tracebacks);
   for (auto i : c10::irange(frames.size())) {
