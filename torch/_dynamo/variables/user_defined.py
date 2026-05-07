@@ -684,7 +684,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 m, self, source_fn=source
             ).call_function(tx, [], {})
         raise_type_error(
-            tx, f"object of type {self.python_type_name()} has no negative"
+            tx, f"bad operand type for unary -: '{self.python_type_name()}'"
         )
 
     def nb_positive_impl(self, tx: "InstructionTranslator") -> VariableTracker:
@@ -695,7 +695,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 m, self, source_fn=source
             ).call_function(tx, [], {})
         raise_type_error(
-            tx, f"object of type {self.python_type_name()} has no positive"
+            tx, f"bad operand type for unary +: '{self.python_type_name()}'"
         )
 
     def nb_absolute_impl(self, tx: "InstructionTranslator") -> VariableTracker:
@@ -1676,7 +1676,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         type_attr = self.lookup_class_mro_attr("__neg__")
         if type_attr is NO_SUCH_SUBOBJ:
             raise_type_error(
-                tx, f"object of type {self.python_type_name()} has no negative"
+                tx, f"bad operand type for unary -: '{self.python_type_name()}'"
             )
         if type_attr is None:
             raise_type_error(tx, "'NoneType' object is not callable")
@@ -1684,7 +1684,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         method = self._maybe_get_baseclass_method("__neg__")
         if method is None:
             raise_type_error(
-                tx, f"object of type {self.python_type_name()} has no negative"
+                tx, f"bad operand type for unary -: '{self.python_type_name()}'"
             )
 
         return self.call_method(tx, "__neg__", [], {})
@@ -1698,7 +1698,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         type_attr = self.lookup_class_mro_attr("__pos__")
         if type_attr is NO_SUCH_SUBOBJ:
             raise_type_error(
-                tx, f"object of type {self.python_type_name()} has no positive"
+                tx, f"bad operand type for unary +: '{self.python_type_name()}'"
             )
         if type_attr is None:
             raise_type_error(tx, "'NoneType' object is not callable")
@@ -1706,7 +1706,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         method = self._maybe_get_baseclass_method("__pos__")
         if method is None:
             raise_type_error(
-                tx, f"object of type {self.python_type_name()} has no positive"
+                tx, f"bad operand type for unary +: '{self.python_type_name()}'",
             )
 
         return self.call_method(tx, "__pos__", [], {})
