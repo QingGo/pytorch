@@ -245,9 +245,16 @@ class ComboKernelTests(TestCase):
         out_eager = fn(*inps)
         fn_c = torch.compile(fn)
         out_compiled, code = run_and_get_code(fn_c, *inps)
-        FileCheck().check("triton_heuristics.persistent_reduction").check(
-            "size_hints={'x': 1024, 'r0_': 32}"
-        ).run(code[0])
+        source_check = FileCheck().check(
+            "triton_heuristics.persistent_reduction"
+        ).check("size_hints={'x': 1024, 'r0_': 32}")
+        if (
+            torch._inductor.config.cpp_wrapper
+            and not torch._inductor.config.triton.autotune_at_compile_time
+        ):
+            self._check_lazy_cpp_wrapper_combo_codegen(code[0], source_check)
+        else:
+            source_check.run(code[0])
         self.assertEqual(out_eager, out_compiled)
 
     @requires_gpu_and_triton

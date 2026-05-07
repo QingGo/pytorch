@@ -4415,6 +4415,25 @@ class TestPrologueFusion(TestCase):
                 "del", num_deallocs, exactly=True
             ).run(code_str)
 
+    def check_triton_source(self, code_str, source_check):
+        if config.cpp_wrapper and not config.triton.autotune_at_compile_time:
+            from torch._inductor.codecache import get_path
+
+            FileCheck().check("static const LazyTritonKernelSpec").check(
+                "launchLazyTritonKernel("
+            ).run(code_str)
+            source_keys = re.findall(
+                r'static const char\* \w+_source_key = "([^"]+)";', code_str
+            )
+            self.assertTrue(source_keys)
+            sources = []
+            for source_key in source_keys:
+                with open(get_path(source_key, "txt")[2]) as f:
+                    sources.append(f.read())
+            source_check.run("\n".join(sources))
+        else:
+            source_check.run(code_str)
+
     @parametrize("sizes", ((64, 128, 256), (128, 128, 128), (63, 120, 250)))
     def test_upcast(self, sizes):
         M, K, N = sizes
@@ -4535,9 +4554,13 @@ class TestPrologueFusion(TestCase):
         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=2)
 
         # check that we do not CSE any variables between prologues, epilogues
-        FileCheck().check("def triton").check_count(
-            "tl.full([1], 1.1, tl.float32)", 3, exactly=True
-        ).check("tl.store").run(code[0])
+        self.check_triton_source(
+            code[0],
+            FileCheck()
+            .check("def triton")
+            .check_count("tl.full([1], 1.1, tl.float32)", 3, exactly=True)
+            .check("tl.store"),
+        )
 
     @config.patch(
         {
