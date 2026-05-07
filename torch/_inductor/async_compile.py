@@ -3,21 +3,31 @@ from __future__ import annotations
 
 import atexit
 import functools
+import io
+import itertools
 import json
 import logging
 import multiprocessing
 import os
+import queue as _queue
 import re
+import shutil
+import socket
 import sys
+import tempfile
+import threading
 from concurrent.futures import (
     Future,
+    InvalidStateError,
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from functools import partial
+from multiprocessing.connection import answer_challenge, Connection, deliver_challenge
 from time import time, time_ns
-from typing import Any, TYPE_CHECKING
+from typing import Any, cast, TYPE_CHECKING
 
 import torch
 from torch._dynamo.device_interface import get_registered_device_interfaces
@@ -54,6 +64,7 @@ from torch._inductor.compile_worker.utils import _async_compile_initializer
 from torch._inductor.runtime.compile_tasks import (
     _set_triton_libdevice_path,
     _set_triton_ptxas_path,
+    _StreamingUnpickler,
     _worker_compile_triton,
 )
 from torch._inductor.utils import clear_on_fresh_cache
@@ -65,7 +76,7 @@ from torch.utils._triton import has_triton_package
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from torch._inductor.runtime.hints import HalideMeta
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
@@ -80,9 +91,227 @@ log = logging.getLogger(__name__)
 
 _triton_kernel_metrics: dict[str, dict[str, Any]] | None = None
 
+# EOF marker on ``launcher_q`` (single producer: ``_bg_drain_kernel``).
+_LAUNCHER_END = object()
+
+
+def _try_set_exception(fut: "Future[Any]", exc: BaseException) -> None:
+    """Race-tolerant ``Future.set_exception``."""
+    try:
+        fut.set_exception(exc)
+    except InvalidStateError:
+        pass
+
+
+def _try_set_result(fut: "Future[Any]", value: Any) -> None:
+    """Race-tolerant ``Future.set_result``."""
+    try:
+        fut.set_result(value)
+    except InvalidStateError:
+        pass
+
+
 size_hints_regex = re.compile(
     r"size_hints=(\{.*?\})",
 )
+
+
+@dataclass
+class PipelineCachingAutotunerHandle:
+    """Per-kernel state shared between ``_bg_drain_kernel`` (writer) and
+    ``PipelineCachingAutotunerPlugin.pre_dispatch`` (reader). EOF on
+    ``launcher_q`` is ``_LAUNCHER_END``. ``bg_drain_wait_ns`` is
+    happens-before-published via ``drain_future`` resolution.
+    """
+
+    launcher_q: _queue.Queue[object]
+    drain_future: Future[None]
+    num_configs: int
+    kernel_name: str
+    bg_drain_wait_ns: int = 0
+
+
+# One process-wide tmpdir for per-kernel AF_UNIX sockets, lazy-created.
+_STREAMING_SOCK_DIR: str | None = None
+_STREAMING_SOCK_DIR_LOCK = threading.Lock()
+
+# Monotonic per-process suffix for sock filenames; next() is GIL-atomic, so
+# names are guaranteed unique within a process. mkdtemp gives a fresh dir per
+# process, so cross-process collisions are impossible.
+_STREAMING_SOCK_COUNTER = itertools.count()
+
+# 10 minutes. Bounds both accept() (worker startup) and recv_bytes() (per-
+# config compile). Picked to be far above any realistic compile time so that
+# only a wedged worker or hijacked listener trips it.
+_STREAMING_TIMEOUT_S = 600.0
+
+
+def _get_streaming_sock_dir() -> str:
+    global _STREAMING_SOCK_DIR
+    if _STREAMING_SOCK_DIR is None:
+        with _STREAMING_SOCK_DIR_LOCK:
+            if _STREAMING_SOCK_DIR is None:
+                d = tempfile.mkdtemp(prefix="inductor_stream_")
+                atexit.register(shutil.rmtree, d, ignore_errors=True)
+                _STREAMING_SOCK_DIR = d
+    return _STREAMING_SOCK_DIR
+
+
+def _setup_streaming_listener(
+    kernel_name: str,
+) -> tuple[str, bytes, socket.socket]:
+    """Bind a per-kernel AF_UNIX listener. Returns (sock_path, authkey, listen_sock).
+    Worker connects to ``sock_path`` and authenticates with ``authkey``; parent
+    ``accept()``s on ``listen_sock`` and runs the mp.connection challenge handshake.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", kernel_name)[:40]
+    sock_path = os.path.join(
+        _get_streaming_sock_dir(),
+        f"{safe}_{next(_STREAMING_SOCK_COUNTER)}.sock",
+    )
+    listen_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listen_sock.bind(sock_path)
+    # Don't trust the caller's umask: bind() inherits it. 0700 parent dir
+    # already blocks cross-UID, but explicit chmod survives anyone changing
+    # the parent path later.
+    os.chmod(sock_path, 0o600)
+    listen_sock.listen(1)
+    listen_sock.settimeout(_STREAMING_TIMEOUT_S)
+    authkey = os.urandom(32)
+    return sock_path, authkey, listen_sock
+
+
+def _bg_drain_kernel(
+    kernel: Any,
+    conn: Connection,
+    handle: PipelineCachingAutotunerHandle,
+    static_triton_bundle_key: str | None,
+) -> None:
+    """Per-kernel daemon: drives ``precompile_from_stream`` with results
+    read off the worker's pipe, fanning launchers out to ``launcher_q``.
+    """
+
+    def _iter_results() -> "Iterable[Any]":
+        # ``recv_bytes()`` blocks waiting on the worker; that wait is the
+        # parent-side cost the plugin folds into compile_time_us.
+        while True:
+            tq0 = time_ns()
+            if not conn.poll(_STREAMING_TIMEOUT_S):
+                raise TimeoutError(
+                    f"streaming worker for {handle.kernel_name} sent no data "
+                    f"for {_STREAMING_TIMEOUT_S:.0f}s"
+                )
+            try:
+                payload = conn.recv_bytes()
+            except EOFError:
+                return
+            handle.bg_drain_wait_ns += time_ns() - tq0
+            yield _StreamingUnpickler(io.BytesIO(payload)).load()
+
+    try:
+        kernel.precompile_from_stream(
+            iter_results=_iter_results(),
+            on_launcher=handle.launcher_q.put,
+            static_triton_bundle_key=static_triton_bundle_key,
+        )
+    except BaseException as e:
+        _try_set_exception(handle.drain_future, e)
+        log.exception("background drain failed for %s", kernel.fn.__name__)
+    else:
+        _try_set_result(handle.drain_future, None)
+    finally:
+        handle.launcher_q.put(_LAUNCHER_END)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def _make_pipeline_caching_autotuner_plugin() -> Any:
+    """Lazy factory: keeps runtime-side imports off the default-off path."""
+    from torch._inductor.runtime.triton_heuristics import (
+        CachingAutotunerPlugin,
+        DEFER,
+    )
+
+    class PipelineCachingAutotunerPlugin(CachingAutotunerPlugin):
+        """At first ``run()``: drain ``launcher_q`` (multi-config) or
+        wait on ``drain_future`` (single-config), bench, finalize, and
+        return ``DEFER`` so the standard dispatch path runs with
+        ``self.launchers == [winner]``.
+        """
+
+        def pre_dispatch(
+            self,
+            autotuner: object,
+            *args: object,
+            stream: object,
+            **kwargs: object,
+        ) -> object:
+            from torch._dynamo.device_interface import DeviceGuard
+            from torch._inductor.runtime.triton_heuristics import (
+                NoTritonConfigsError,
+            )
+
+            handle = autotuner._pipeline_caching_autotuner_handle
+            if handle is None:
+                return DEFER
+            autotuner._pipeline_caching_autotuner_handle = None
+
+            plugin_wait_ns = 0
+            bench_ns = 0
+
+            if handle.num_configs <= 1:
+                # Nothing to compare against; just wait for finalization.
+                tq0 = time_ns()
+                handle.drain_future.result()  # re-raises drain exception
+                plugin_wait_ns += time_ns() - tq0
+            else:
+                def _drain_launchers() -> "Iterable[Any]":
+                    nonlocal plugin_wait_ns
+                    while True:
+                        tq0 = time_ns()
+                        launcher = handle.launcher_q.get()
+                        plugin_wait_ns += time_ns() - tq0
+                        if launcher is _LAUNCHER_END:
+                            return
+                        yield launcher
+
+                with DeviceGuard(
+                    autotuner.get_device_interface(),
+                    autotuner.triton_meta["device"],
+                ):
+                    timings, bench_ns = autotuner._bench_launchers(
+                        _drain_launchers(), *args, **kwargs
+                    )
+                # Drain pushed its sentinel even on failure; surface now.
+                handle.drain_future.result()
+
+            if not autotuner.launchers and not autotuner.compile_results:
+                raise NoTritonConfigsError(
+                    f"Pipelined autotuner produced 0 results for "
+                    f"{autotuner.fn.__name__}"
+                )
+
+            # parent_us = wall time the parent's threads spent blocked
+            # waiting for compile data. Worker-subprocess time is
+            # intentionally not measured here.
+            parent_wait_ns = handle.bg_drain_wait_ns + plugin_wait_ns
+
+            if handle.num_configs > 1 and timings:
+                autotuner._finalize_autotune_winner(
+                    timings,
+                    autotune_time_taken_ns=parent_wait_ns + bench_ns,
+                )
+
+            _emit_triton_kernel_compile_metric(
+                handle.kernel_name,
+                parent_wait_ns // 1000,
+                autotune_cache_info=autotuner.autotune_cache_info,
+            )
+            return DEFER
+
+    return PipelineCachingAutotunerPlugin()
 
 
 def pre_fork_setup():
@@ -141,6 +370,23 @@ def _add_triton_kernel_info(kernel_name: str, info: dict[str, Any]):
     # Must be called between _compile_start and _compile_end
     if _triton_kernel_metrics is not None:
         _triton_kernel_metrics[kernel_name] = info
+
+
+def _emit_triton_kernel_compile_metric(
+    kernel_name: str,
+    elapsed_us: int,
+    autotune_cache_info: dict[str, Any] | None = None,
+) -> None:
+    """Emit per-kernel ``compile_time_us`` to both the dynamo
+    ``_triton_kernel_metrics`` map and the ``MetricsContext`` top-N.
+    Used by both the standard ``AsyncCompile.triton`` path and the
+    ``PipelineCachingAutotunerPlugin``."""
+    info = dict(autotune_cache_info) if autotune_cache_info else {}
+    info["compile_time_us"] = elapsed_us
+    _add_triton_kernel_info(kernel_name, info)
+    get_metrics_context().add_top_n(
+        "triton_kernel_compile_times_us", kernel_name, elapsed_us
+    )
 
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -443,18 +689,96 @@ class AsyncCompile:
                         fn_hash: torch._inductor.config.autotune_lookup_table[fn_hash]
                     }
 
+            if config.pipeline_caching_autotuner:
+                sock_path, authkey, listen_sock = _setup_streaming_listener(
+                    kernel_name
+                )
+            else:
+                sock_path = None
+                authkey = None
+                listen_sock = None
+
             task = self.process_pool().submit(
                 _worker_compile_triton,
                 load_kernel,
                 extra_env,
                 extra_config,
+                streaming_address=sock_path,
+                streaming_authkey=authkey,
             )
 
+            if config.pipeline_caching_autotuner:
+                # If the worker dies before connecting, accept() blocks
+                # forever. Closing the listener unblocks it with OSError.
+                assert listen_sock is not None
+
+                def _on_task_fail_close_listener(future: Future) -> None:
+                    if future.exception() is not None:
+                        try:
+                            listen_sock.close()
+                        except OSError:
+                            pass
+
+                task.add_done_callback(_on_task_fail_close_listener)
+
             def get_result() -> CachingAutotuner:
-                try:
-                    kernel, elapsed_us = task.result()
-                except SubprocException as e:
-                    raise e.with_name(kernel_name) from e
+                elapsed_us: int | None = None
+                if config.pipeline_caching_autotuner:
+                    assert listen_sock is not None and sock_path is not None
+                    assert authkey is not None
+                    try:
+                        # Times out per listen_sock.settimeout in setup.
+                        conn_sock, _ = listen_sock.accept()
+                    except OSError:
+                        # Re-raises if the worker failed; otherwise spurious
+                        # close or timeout - surface as a generic stream error.
+                        try:
+                            task.result()
+                        except SubprocException as e:
+                            raise e.with_name(kernel_name) from e
+                        raise RuntimeError(
+                            f"streaming listener closed before {kernel_name} connected"
+                        )
+                    finally:
+                        try:
+                            os.unlink(sock_path)
+                        except OSError:
+                            pass
+                    listen_sock.close()
+                    conn = Connection(conn_sock.detach())
+                    # mp.connection challenge/answer handshake: rejects any
+                    # peer that doesn't share authkey.
+                    deliver_challenge(conn, authkey)
+                    answer_challenge(conn, authkey)
+                    if not conn.poll(_STREAMING_TIMEOUT_S):
+                        raise TimeoutError(
+                            f"streaming worker for {kernel_name} sent no kernel "
+                            f"for {_STREAMING_TIMEOUT_S:.0f}s"
+                        )
+                    try:
+                        kernel_bytes = conn.recv_bytes()
+                    except EOFError:
+                        try:
+                            task.result()
+                        except SubprocException as e:
+                            raise e.with_name(kernel_name) from e
+                        raise RuntimeError(
+                            f"worker for {kernel_name} closed pipe before sending kernel"
+                        )
+                    kernel = cast(
+                        "CachingAutotuner",
+                        _StreamingUnpickler(io.BytesIO(kernel_bytes)).load(),
+                    )
+                else:
+                    try:
+                        result = task.result()
+                    except SubprocException as e:
+                        raise e.with_name(kernel_name) from e
+                    kernel_or_none, elapsed_us = result
+                    assert kernel_or_none is not None, (
+                        "non-streaming worker must return a kernel"
+                    )
+                    kernel = kernel_or_none
 
                 # Now that we've compiled, we should clear the future
                 # so it can't be used again
@@ -463,17 +787,45 @@ class AsyncCompile:
 
                 kernel.restore_after_unpickle(old_values=None)
 
-                kernel.precompile(
-                    warm_cache_only=False,
-                    reload_kernel=reload_kernel_in_parent,
-                    static_triton_bundle_key=CompiledTritonKernels.key(source_code),
-                )
-                info = kernel.autotune_cache_info or {}
-                info["compile_time_us"] = elapsed_us
-                _add_triton_kernel_info(kernel_name, info)
-                get_metrics_context().add_top_n(
-                    "triton_kernel_compile_times_us", kernel_name, elapsed_us
-                )
+                if config.pipeline_caching_autotuner:
+                    # Stash the handle + ``_reload_kernel`` (normally set by
+                    # ``precompile``) so coordesc / rblock scaling can still
+                    # reload the JITFunction. The bg drain thread below does
+                    # the precompile work.
+                    handle = PipelineCachingAutotunerHandle(
+                        launcher_q=_queue.Queue(),
+                        drain_future=Future(),
+                        num_configs=len(kernel.configs or []),
+                        kernel_name=kernel_name,
+                    )
+                    kernel._pipeline_caching_autotuner_handle = handle
+                    kernel._reload_kernel = reload_kernel_in_parent
+
+                    threading.Thread(
+                        target=_bg_drain_kernel,
+                        args=(
+                            kernel,
+                            conn,
+                            handle,
+                            CompiledTritonKernels.key(source_code),
+                        ),
+                        name=f"inductor-stream-bg-drain-{kernel_name}",
+                        daemon=True,
+                    ).start()
+                else:
+                    kernel.precompile(
+                        warm_cache_only=False,
+                        reload_kernel=reload_kernel_in_parent,
+                        static_triton_bundle_key=CompiledTritonKernels.key(
+                            source_code
+                        ),
+                    )
+                    assert elapsed_us is not None
+                    _emit_triton_kernel_compile_metric(
+                        kernel_name,
+                        elapsed_us,
+                        autotune_cache_info=kernel.autotune_cache_info,
+                    )
                 return kernel
 
             future = LambdaFuture(get_result, future=task)
@@ -499,12 +851,11 @@ class AsyncCompile:
                         static_triton_bundle_key=CompiledTritonKernels.key(source_code),
                     )
                     elapsed_us = (time_ns() - start_ns) // 1000
-                    get_metrics_context().add_top_n(
-                        "triton_kernel_compile_times_us", kernel_name, elapsed_us
+                    _emit_triton_kernel_compile_metric(
+                        kernel_name,
+                        elapsed_us,
+                        autotune_cache_info=kernel.autotune_cache_info,
                     )
-                    info = kernel.autotune_cache_info or {}
-                    info["compile_time_us"] = elapsed_us
-                    _add_triton_kernel_info(kernel_name, info)
                     return kernel
                 except Exception as e:
                     fail = str(e)

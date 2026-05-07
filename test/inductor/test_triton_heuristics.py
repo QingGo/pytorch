@@ -1,10 +1,17 @@
 # Owner(s): ["module: inductor"]
 
 import functools
+import io
 import os
+import pickle
+import queue
+import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import Future
 from unittest import skipUnless
 from unittest.mock import MagicMock, patch
 
@@ -472,6 +479,402 @@ class TestCachingAutotunerPlugin(TestCase):
         revived = CachingAutotuner.__new__(CachingAutotuner)
         revived.__setstate__(state)
         self.assertEqual(revived._plugins, [])
+
+
+class TestPipelineCachingAutotunerPlugin(TestCase):
+    """Synchronization between ``_bg_drain_kernel`` and the plugin's
+    ``pre_dispatch`` hook on multi-config, single-config, overlap, and
+    error paths."""
+
+    device_type = GPU_TYPE
+
+    @staticmethod
+    def _make_handle(
+        *,
+        num_configs,
+        drain_done=True,
+        drain_exc=None,
+        push_launcher_end=True,
+    ):
+        """Build a ``PipelineCachingAutotunerHandle`` with the drain
+        future pre-resolved per the simulation knobs."""
+        from torch._inductor.async_compile import (
+            _LAUNCHER_END,
+            PipelineCachingAutotunerHandle,
+        )
+
+        drain_fut: Future = Future()
+        if drain_exc is not None:
+            drain_fut.set_exception(drain_exc)
+        elif drain_done:
+            drain_fut.set_result(None)
+        launcher_q: queue.Queue = queue.Queue()
+        if push_launcher_end:
+            launcher_q.put(_LAUNCHER_END)
+        return PipelineCachingAutotunerHandle(
+            launcher_q=launcher_q,
+            drain_future=drain_fut,
+            num_configs=num_configs,
+            kernel_name="test_kernel",
+        )
+
+    def _make_autotuner(self):
+        args = TestTritonHeuristics._get_cos_kernel_caching_autotuner_args()
+        args["inductor_meta"] = {**args["inductor_meta"], "grid_type": "Grid1D"}
+        return CachingAutotuner(**args)
+
+    def _make_plugin(self):
+        from torch._inductor.async_compile import (
+            _make_pipeline_caching_autotuner_plugin,
+        )
+
+        return _make_pipeline_caching_autotuner_plugin()
+
+    def test_pre_dispatch_no_op_without_handle(self):
+        """No stashed handle → ``pre_dispatch`` is a no-op (returns
+        ``DEFER``)."""
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        result = plugin.pre_dispatch(autotuner, stream=0)
+        self.assertIs(result, DEFER)
+
+    def test_pre_dispatch_single_config_waits_for_drain_no_bench(self):
+        """Single-config kernel: plugin awaits ``drain_future`` and
+        proceeds without bench. ``run()``'s standard flow then sees
+        ``len(launchers) == 1`` and skips autotune."""
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        launcher = MagicMock()
+        autotuner.launchers = [launcher]
+        autotuner.compile_results = [MagicMock()]
+        autotuner._pipeline_caching_autotuner_handle = self._make_handle(
+            num_configs=1
+        )
+        autotuner.bench = MagicMock()
+
+        result = plugin.pre_dispatch(autotuner, stream=0)
+
+        self.assertIs(result, DEFER)
+        autotuner.bench.assert_not_called()
+        self.assertEqual(autotuner.launchers, [launcher])
+        self.assertIsNone(autotuner._pipeline_caching_autotuner_handle)
+
+    def test_pre_dispatch_multi_config_drains_launcher_q_picks_winner(self):
+        """Multi-config kernel: plugin pulls launchers from
+        ``handle.launcher_q``, benches each via ``_bench_launchers``,
+        and ``_finalize_autotune_winner`` reduces ``autotuner.launchers``
+        to ``[winner]``."""
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        launcher_fast, launcher_slow = MagicMock(), MagicMock()
+        launcher_fast.cache_hash = "lf"
+        launcher_slow.cache_hash = "ls"
+        autotuner.launchers = [launcher_fast, launcher_slow]
+        autotuner.compile_results = [MagicMock(), MagicMock()]
+        handle = self._make_handle(num_configs=2)
+        for launcher in (launcher_fast, launcher_slow):
+            # Insert before the LAUNCHER_END that _make_handle pushed.
+            handle.launcher_q.queue.insert(-1, launcher)
+        autotuner._pipeline_caching_autotuner_handle = handle
+        autotuner.bench = MagicMock(side_effect=[1.0, 5.0])
+        autotuner.coordesc_tuner = MagicMock()
+        autotuner.save_cache_hook = None
+        autotuner.get_device_interface = MagicMock()
+
+        with patch("torch._dynamo.device_interface.DeviceGuard"):
+            result = plugin.pre_dispatch(autotuner, stream=0)
+
+        self.assertIs(result, DEFER)
+        self.assertEqual(autotuner.bench.call_count, 2)
+        self.assertEqual(autotuner.launchers, [launcher_fast])
+        self.assertIsNone(autotuner._pipeline_caching_autotuner_handle)
+
+    def test_pre_dispatch_multi_config_overlaps_with_bg_drain(self):
+        """Plugin consumes ``launcher_q`` blocking-style — it begins
+        benching as soon as the FIRST launcher arrives, without waiting
+        for the bg drain to finish making all of them."""
+        from torch._inductor.async_compile import _LAUNCHER_END
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        launcher_a, launcher_b = MagicMock(), MagicMock()
+        launcher_a.cache_hash = "la"
+        launcher_b.cache_hash = "lb"
+        autotuner.launchers = [launcher_a, launcher_b]
+        autotuner.compile_results = [MagicMock(), MagicMock()]
+        handle = self._make_handle(num_configs=2, push_launcher_end=False)
+        autotuner._pipeline_caching_autotuner_handle = handle
+        autotuner.coordesc_tuner = MagicMock()
+        autotuner.save_cache_hook = None
+        autotuner.get_device_interface = MagicMock()
+
+        bench_results = [1.0, 5.0]
+        bench_call_observed = threading.Event()
+
+        def bench_side_effect(*args, **kwargs):
+            bench_call_observed.set()
+            return bench_results.pop(0)
+
+        autotuner.bench = MagicMock(side_effect=bench_side_effect)
+
+        def pusher():
+            handle.launcher_q.put(launcher_a)
+            # Wait until the plugin has actually started benching
+            # launcher_a before we push launcher_b — proves the plugin
+            # didn't block waiting for all launchers up-front.
+            bench_call_observed.wait(timeout=2.0)
+            handle.launcher_q.put(launcher_b)
+            handle.launcher_q.put(_LAUNCHER_END)
+
+        t = threading.Thread(target=pusher, daemon=True)
+        t.start()
+
+        with patch("torch._dynamo.device_interface.DeviceGuard"):
+            result = plugin.pre_dispatch(autotuner, stream=0)
+        t.join(timeout=2.0)
+
+        self.assertIs(result, DEFER)
+        self.assertEqual(autotuner.bench.call_count, 2)
+        self.assertEqual(autotuner.launchers, [launcher_a])
+
+    def test_pre_dispatch_reraises_drain_exception(self):
+        """If the bg drainer caught an exception, ``drain_future`` is
+        resolved with it (and ``_LAUNCHER_END`` is pushed so the plugin's
+        bench loop terminates). The plugin re-raises via
+        ``drain_future.result()`` so the user sees the failure."""
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        autotuner.launchers = []
+        autotuner.compile_results = []
+        autotuner._pipeline_caching_autotuner_handle = self._make_handle(
+            num_configs=1, drain_exc=RuntimeError("boom")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            plugin.pre_dispatch(autotuner, stream=0)
+
+    def test_pre_dispatch_raises_when_zero_results_streamed(self):
+        """Worker-side total-failure surfaces ``NoTritonConfigsError``
+        when the bg drainer ends with no compile_results AND no launchers."""
+        from torch._inductor.runtime.triton_heuristics import (
+            NoTritonConfigsError,
+        )
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        autotuner.launchers = []
+        autotuner.compile_results = []
+        autotuner._pipeline_caching_autotuner_handle = self._make_handle(
+            num_configs=1
+        )
+
+        with self.assertRaises(NoTritonConfigsError):
+            plugin.pre_dispatch(autotuner, stream=0)
+
+
+class TestStreamingPickler(TestCase):
+    """Wire-format coverage for ``_StreamingPickler`` /
+    ``_StreamingUnpickler``: every object the persistent_id callback
+    substitutes must round-trip to ``None`` on the parent side, and
+    everything else must pass through untouched."""
+
+    @staticmethod
+    def _round_trip(obj):
+        from torch._inductor.runtime.compile_tasks import (
+            _StreamingPickler,
+            _StreamingUnpickler,
+        )
+
+        buf = io.BytesIO()
+        _StreamingPickler(buf, protocol=pickle.HIGHEST_PROTOCOL).dump(obj)
+        buf.seek(0)
+        return _StreamingUnpickler(buf).load()
+
+    def test_rlock_substituted_with_none(self):
+        loaded = self._round_trip({"lock": threading.RLock(), "value": 42})
+        self.assertIsNone(loaded["lock"])
+        self.assertEqual(loaded["value"], 42)
+
+    def test_module_substituted_with_none(self):
+        loaded = self._round_trip({"mod": os, "name": "hello"})
+        self.assertIsNone(loaded["mod"])
+        self.assertEqual(loaded["name"], "hello")
+
+    def test_dyn_module_function_substituted_with_none(self):
+        from types import ModuleType
+
+        from torch._inductor.runtime.compile_tasks import (
+            _DYN_KERNEL_MODULE_PREFIX,
+        )
+
+        fake_mod_name = f"{_DYN_KERNEL_MODULE_PREFIX}fake_test_kernel"
+        fake_mod = ModuleType(fake_mod_name)
+        sys.modules[fake_mod_name] = fake_mod
+        try:
+            exec("def fake_kernel(): pass", fake_mod.__dict__)
+            loaded = self._round_trip({"fn": fake_mod.fake_kernel, "value": "x"})
+            self.assertIsNone(loaded["fn"])
+            self.assertEqual(loaded["value"], "x")
+        finally:
+            del sys.modules[fake_mod_name]
+
+    def test_normal_function_preserved(self):
+        # math.sqrt is a builtin, importable on the parent.
+        import math
+
+        loaded = self._round_trip({"fn": math.sqrt, "value": 9})
+        self.assertIs(loaded["fn"], math.sqrt)
+        self.assertEqual(loaded["value"], 9)
+
+    def test_unknown_persistent_id_raises(self):
+        from torch._inductor.runtime.compile_tasks import _StreamingUnpickler
+
+        class BadPickler(pickle.Pickler):
+            def persistent_id(self, obj):
+                if isinstance(obj, list):
+                    return ("bogus_id",)
+                return None
+
+        buf = io.BytesIO()
+        BadPickler(buf, protocol=pickle.HIGHEST_PROTOCOL).dump({"data": [1, 2]})
+        buf.seek(0)
+        with self.assertRaises(pickle.UnpicklingError):
+            _StreamingUnpickler(buf).load()
+
+
+class TestStreamingTransport(TestCase):
+    """Per-kernel AF_UNIX listener: worker connects, sends kernel + results,
+    parent reads them in order until EOF."""
+
+    def test_listener_round_trip(self):
+        """Bind a listener, connect a fake worker via Client with authkey,
+        send a kernel + 2 results, close, verify the parent sees them in
+        order followed by EOFError."""
+        from multiprocessing.connection import (
+            answer_challenge,
+            Client,
+            Connection,
+            deliver_challenge,
+        )
+
+        from torch._inductor.async_compile import _setup_streaming_listener
+        from torch._inductor.runtime.compile_tasks import (
+            _streaming_send,
+            _StreamingUnpickler,
+        )
+
+        sock_path, authkey, listen_sock = _setup_streaming_listener("k")
+        try:
+
+            def _client_thread():
+                conn = Client(sock_path, authkey=authkey)
+                try:
+                    _streaming_send(conn, "fake-kernel-payload")
+                    _streaming_send(conn, "result-1")
+                    _streaming_send(conn, "result-2")
+                finally:
+                    conn.close()
+
+            t = threading.Thread(target=_client_thread, daemon=True)
+            t.start()
+            try:
+                conn_sock, _ = listen_sock.accept()
+            finally:
+                listen_sock.close()
+            parent = Connection(conn_sock.detach())
+            deliver_challenge(parent, authkey)
+            answer_challenge(parent, authkey)
+            try:
+                msgs = []
+                try:
+                    while True:
+                        payload = parent.recv_bytes()
+                        msgs.append(
+                            _StreamingUnpickler(io.BytesIO(payload)).load()
+                        )
+                except EOFError:
+                    pass
+                self.assertEqual(
+                    msgs, ["fake-kernel-payload", "result-1", "result-2"]
+                )
+            finally:
+                parent.close()
+            t.join(timeout=2.0)
+        finally:
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+
+    def test_setup_streaming_listener_unique_paths(self):
+        """Each call returns a fresh socket path with its own authkey."""
+        from torch._inductor.async_compile import _setup_streaming_listener
+
+        path1, authkey1, sock1 = _setup_streaming_listener("k1")
+        path2, authkey2, sock2 = _setup_streaming_listener("k2")
+        try:
+            self.assertNotEqual(path1, path2)
+            self.assertNotEqual(authkey1, authkey2)
+            self.assertEqual(len(authkey1), 32)
+            self.assertEqual(stat.S_IMODE(os.stat(path1).st_mode), 0o600)
+        finally:
+            sock1.close()
+            sock2.close()
+            for p in (path1, path2):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def test_wrong_authkey_rejected(self):
+        """Client with a mismatched authkey must fail the handshake."""
+        from multiprocessing.connection import (
+            AuthenticationError,
+            Client,
+            Connection,
+            deliver_challenge,
+        )
+
+        from torch._inductor.async_compile import _setup_streaming_listener
+
+        sock_path, authkey, listen_sock = _setup_streaming_listener("k")
+        client_err: list[BaseException] = []
+        try:
+
+            def _client_thread():
+                try:
+                    Client(sock_path, authkey=b"x" * 32).close()
+                except BaseException as e:
+                    client_err.append(e)
+
+            t = threading.Thread(target=_client_thread, daemon=True)
+            t.start()
+            try:
+                conn_sock, _ = listen_sock.accept()
+            finally:
+                listen_sock.close()
+            parent = Connection(conn_sock.detach())
+            try:
+                with self.assertRaises(AuthenticationError):
+                    deliver_challenge(parent, authkey)
+            finally:
+                parent.close()
+            t.join(timeout=2.0)
+            self.assertTrue(
+                client_err and isinstance(client_err[0], AuthenticationError)
+            )
+        finally:
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
 
 
 class TestArgumentCloneAndRestore(TestCase):

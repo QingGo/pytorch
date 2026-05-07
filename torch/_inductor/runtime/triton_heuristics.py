@@ -1,7 +1,6 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
-import builtins
 import copy
 import dataclasses
 import enum
@@ -19,6 +18,7 @@ import sys
 import threading
 import time
 from collections import namedtuple
+from collections.abc import Hashable
 from typing import Any, Final, Generic, Literal, TYPE_CHECKING, TypeVar
 
 import torch
@@ -110,7 +110,12 @@ class NoTritonConfigsError(RuntimeError):
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Container, Hashable
+    from collections.abc import (
+        Callable,
+        Container,
+        Generator,
+        Iterable,
+    )
 
     from torch._C._profiler import _RecordFunctionFast
     from torch._guards import CompileId
@@ -124,6 +129,10 @@ _KernelType = (
 _T = TypeVar("_T", bound=_KernelType)
 
 log = logging.getLogger(__name__)
+
+# Cap parallel-compile thread count per worker. Triton AST visit is GIL-
+# bound; more threads add scheduler overhead without speeding compile.
+_PARALLEL_COMPILE_THREAD_CAP = 8
 
 triton_name_sub = re.compile(r"^def [^(]+\(")
 
@@ -394,7 +403,19 @@ def get_caching_autotuner_plugins(
     Each plugin adds an entry here, gated on its own config flag, with
     imports kept inside the relevant branch.
     """
+    from torch._inductor import config
+
     plugins: list[CachingAutotunerPlugin] = []
+    if config.pipeline_caching_autotuner:
+        # Lazy import: the plugin lives in ``async_compile`` (alongside
+        # the streaming setup helpers), and importing
+        # ``async_compile`` at module-load time would create an upward
+        # dependency from runtime/ into _inductor/.
+        from torch._inductor.async_compile import (
+            _make_pipeline_caching_autotuner_plugin,
+        )
+
+        plugins.append(_make_pipeline_caching_autotuner_plugin())
     return plugins
 
 
@@ -529,6 +550,17 @@ class CachingAutotuner(KernelInterface):
             and not self.dump_launch_tensors
         )
 
+        # Last per-config compile exception caught by ``_iter_compile_results``;
+        # consulted by ``_precompile_worker`` to enrich the "all configs failed"
+        # error message.
+        self._last_compile_exception: BaseException | None = None
+
+        # Set by ``AsyncCompile.triton`` when the pipelined-autotuner path
+        # is active; consumed and reset to None by
+        # ``PipelineCachingAutotunerPlugin.pre_dispatch`` on first ``run()``.
+        # Typed as Any to dodge a forward-ref to ``async_compile``.
+        self._pipeline_caching_autotuner_handle: Any = None
+
         self._plugins = get_caching_autotuner_plugins(self)
 
         # Compile-time info included in runtime logginging
@@ -595,60 +627,111 @@ class CachingAutotuner(KernelInterface):
         reload_kernel: Callable[[], CachingAutotuner] | None = None,
         static_triton_bundle_key: str | None = None,
     ):
+        """Compile every config, build launchers, do rblock scaling, and
+        register with TritonBundler."""
         if warm_cache_only:
             self._precompile_worker()
             return
         with self.lock:
-            # Helper function for reloading a kernel generated in a worker
-            # in the parent class. Normally we don't need to reload the kernel
-            # in the parent process, but in certain cases (coordesc tuning, dynamic_scale_rblock),
-            # we need to actually run compilation on the parent process
+            # ``_reload_kernel`` is needed by coordesc / dynamic_scale_rblock
+            # paths that run compile in the parent post-pickle.
             if reload_kernel is not None:
                 self._reload_kernel = reload_kernel
-            # Plugin opt-out: ``pre_compile`` returning anything other
-            # than ``DEFER`` means the plugin owns compile + launcher
-            # creation entirely. We return without running
-            # ``_precompile_worker`` / ``_make_launchers`` /
-            # ``_dynamic_scale_rblock``.
+            # ``pre_compile`` returning non-DEFER: plugin owns compile +
+            # launcher creation; skip our pipeline.
             for plugin in self._plugins:
                 if plugin.pre_compile(self) is not DEFER:
                     return
             self._precompile_worker()
-            if static_triton_bundle_key is not None and self.is_statically_launchable():
-                TritonBundler.put_static_autotuner(static_triton_bundle_key, self)
+            self._maybe_put_static_autotuner(static_triton_bundle_key)
             self._make_launchers()
             self._dynamic_scale_rblock()
+
+    def precompile_from_stream(
+        self,
+        iter_results: Iterable[CompileResult],
+        on_launcher: Callable[[LauncherType], None],
+        reload_kernel: Callable[[], CachingAutotuner] | None = None,
+        static_triton_bundle_key: str | None = None,
+    ):
+        """Streaming variant of :meth:`precompile` for the pipelined-
+        autotuner bg drain: ``iter_results`` provides ``CompileResult``s
+        as they arrive from the worker, ``on_launcher`` fires per
+        launcher as they're built.
+        """
+        with self.lock:
+            if reload_kernel is not None:
+                self._reload_kernel = reload_kernel
+            for plugin in self._plugins:
+                if plugin.pre_compile(self) is not DEFER:
+                    return
+            self._maybe_put_static_autotuner(static_triton_bundle_key)
+            self._make_launchers_from_stream(iter_results, on_launcher)
+            self._dynamic_scale_rblock(on_launcher=on_launcher)
 
     def _precompile_worker(self):
         if self.compile_results:
             for result in self.compile_results:
-                TritonBundler.put(
-                    triton_hash_to_path_key(result.kernel.hash),  # type: ignore[attr-defined]
-                    self.triton_meta.get("device", 0),
-                )
+                self._bundle_compile_result(result)
             return
         assert not self.launchers
         if not self.configs:
             raise NoTritonConfigsError("No triton configs are available")
 
-        compile_results = []
-        exc = None
-        for c in self.configs:
-            try:
-                compile_results.append(self._precompile_config(c))
-            except (OutOfResources, PTXASError, IntelGPUError) as e:
-                exc = e
-        if len(compile_results) == 0:
-            raise NoTritonConfigsError(
-                f"No valid triton configs. {type(exc).__name__}: {exc}"
+        self.compile_results = list(self._iter_compile_results())
+        if not self.compile_results:
+            last_exc = self._last_compile_exception
+            exc_str = (
+                f" {type(last_exc).__name__}: {last_exc}"
+                if last_exc is not None
+                else ""
             )
-        self.compile_results = compile_results
+            raise NoTritonConfigsError(
+                f"No valid triton configs compiled for {self.fn.__name__}.{exc_str}"
+            )
         self.configs = None
+
+    def _iter_compile_results(
+        self, parallel: bool = False
+    ) -> Generator[CompileResult, None, None]:
+        """Yield successful ``CompileResult``s. OOM / PTXAS / IntelGPU
+        failures are dropped; the last one is kept on
+        ``self._last_compile_exception`` for the all-failed error.
+        ``parallel`` thread-pools the compile (capped at
+        ``_PARALLEL_COMPILE_THREAD_CAP`` -- Triton AST visit is GIL-bound).
+        """
+        self._last_compile_exception = None
+        configs = list(self.configs or [])
+        if not configs:
+            return
+
+        if parallel:
+            from concurrent.futures import as_completed, ThreadPoolExecutor
+
+            with ThreadPoolExecutor(
+                max_workers=min(len(configs), _PARALLEL_COMPILE_THREAD_CAP)
+            ) as executor:
+                futures = [
+                    executor.submit(self._precompile_config, c) for c in configs
+                ]
+                for future in as_completed(futures):
+                    try:
+                        yield future.result()
+                    except (OutOfResources, PTXASError, IntelGPUError) as e:
+                        self._last_compile_exception = e
+                        continue
+        else:
+            for c in configs:
+                try:
+                    yield self._precompile_config(c)
+                except (OutOfResources, PTXASError, IntelGPUError) as e:
+                    self._last_compile_exception = e
+                    continue
 
     @functools.cached_property
     def _could_rblock_scale(self) -> bool:
-        """Whether ``_dynamic_scale_rblock`` should attempt occupancy-
-        driven rblock halving for this autotuner.
+        """Pure predicate: would occupancy-driven rblock halving even apply
+        to this autotuner? Gates ``_dynamic_scale_rblock``.
         """
         device_prop = self.device_props
         return (
@@ -668,6 +751,10 @@ class CachingAutotuner(KernelInterface):
         """Yield new configs with halved rblock for occupancy improvement.
 
         Caller is responsible for gating on ``self._could_rblock_scale``.
+        Iterates ``self.compile_results`` live (caller appends new
+        results into it as we yield), so a newly-halved config is itself
+        a candidate for further halving. Termination relies on the
+        rblock-too-small short-circuit and the seen-hash dedup.
         """
         # TODO(jansel): we should find a way to move this extra compile into the worker process
         # Currently it relies on _make_launchers(), which requires a cuda context, to populate nreg.
@@ -756,7 +843,10 @@ class CachingAutotuner(KernelInterface):
             self._ensure_kernel_loaded()
             yield new_config
 
-    def _dynamic_scale_rblock(self):
+    def _dynamic_scale_rblock(
+        self,
+        on_launcher: Callable[[LauncherType], None] | None = None,
+    ):
         if (
             self.autotune_cache_info
             and self.autotune_cache_info.get("autotune_cache_state") == "hit"
@@ -764,9 +854,18 @@ class CachingAutotuner(KernelInterface):
             return
         if not self._could_rblock_scale:
             return
-        for new_config in self._iter_rblock_scale_candidates():
-            self.compile_results.append(self._precompile_config(new_config))  # noqa: B909
-        self._make_launchers()
+        from torch._dynamo.device_interface import DeviceGuard
+
+        with DeviceGuard(self.get_device_interface(), self.triton_meta["device"]):
+            for new_config in self._iter_rblock_scale_candidates():
+                result = self._precompile_config(new_config)
+                self.compile_results.append(result)  # noqa: B909
+                self._bundle_compile_result(result)
+                launcher, _ = self._make_launcher(result)
+                if launcher is not None:
+                    self.launchers.append(launcher)
+                    if on_launcher is not None:
+                        on_launcher(launcher)
 
     def compile_by_disabling_pipelining(self, config):
         self._ensure_kernel_loaded()
@@ -797,36 +896,128 @@ class CachingAutotuner(KernelInterface):
             return None, e
 
     def _make_launchers(self):
+        """Build launchers for any ``self.compile_results`` that don't have
+        one yet."""
         if len(self.launchers) == len(self.compile_results):
             return
-
         from torch._dynamo.device_interface import DeviceGuard
 
-        device_interface = self.get_device_interface()
-        launchers = []
-        exc = None
-        # DeviceGuard ensures each launcher's binary loads onto the right device.
-        with DeviceGuard(device_interface, self.triton_meta["device"]):
-            for result in self.compile_results:
+        last_exc: Exception | None = None
+        new_launchers: list[LauncherType] = []
+        with DeviceGuard(self.get_device_interface(), self.triton_meta["device"]):
+            for result in self.compile_results[len(self.launchers) :]:
                 launcher, exc = self._make_launcher(result)
                 if launcher is not None:
-                    launchers.append(launcher)
-            if len(launchers) == 0:
-                result = self.compile_results[-1]
-                config = result.config
-                if (
-                    isinstance(exc, (OutOfResources, torch.cuda.OutOfMemoryError))
-                    and (
-                        config.num_stages > 1 or config.kwargs.get("NUM_STAGES", 1) > 1
-                    )
-                    and self.inductor_meta.get("dynamic_disable_pipelining", True)
-                ):
-                    self.launchers = [self.compile_by_disabling_pipelining(config)]
-                    return
-                raise RuntimeError(
-                    f"No valid triton configs. {type(exc).__name__}: {exc}"
-                )
-        self.launchers = launchers
+                    new_launchers.append(launcher)
+                else:
+                    last_exc = exc
+            if not (self.launchers or new_launchers) and self.compile_results:
+                self._all_failed_fallback(last_exc)
+                return
+        self.launchers.extend(new_launchers)
+
+    def _make_launchers_from_stream(
+        self,
+        iter_results: Iterable[CompileResult],
+        on_launcher: Callable[[LauncherType], None],
+    ):
+        """Streaming variant: bundles + appends each result as it arrives,
+        builds a launcher, and fires ``on_launcher``. ``self.launchers``
+        is appended in-place; readers see partial progress.
+        """
+        from torch._dynamo.device_interface import DeviceGuard
+
+        last_exc: Exception | None = None
+        with DeviceGuard(self.get_device_interface(), self.triton_meta["device"]):
+            for result in iter_results:
+                self.compile_results.append(result)  # noqa: B909
+                self._bundle_compile_result(result)
+                launcher, exc = self._make_launcher(result)
+                if launcher is not None:
+                    self.launchers.append(launcher)
+                    on_launcher(launcher)
+                else:
+                    last_exc = exc
+            self.configs = None  # mirror ``_precompile_worker`` post-condition
+            if not self.launchers and self.compile_results:
+                self._all_failed_fallback(last_exc)
+                if self.launchers:
+                    on_launcher(self.launchers[-1])
+
+    def _bundle_compile_result(self, result: CompileResult[_KernelType]) -> None:
+        """Parent-side ``TritonBundler.put`` for a result received from
+        a worker (pickled-back rehydrate or streaming drain).
+        """
+        TritonBundler.put(
+            triton_hash_to_path_key(result.kernel.hash),  # type: ignore[attr-defined]
+            self.triton_meta.get("device", 0),
+        )
+
+    def _all_failed_fallback(self, exc: BaseException | None) -> None:
+        """If the last failure was OOM on a pipelined config, retry with
+        pipelining disabled; otherwise raise. Caller holds the DeviceGuard.
+        """
+        result = self.compile_results[-1]
+        config = result.config
+        if (
+            isinstance(exc, (OutOfResources, torch.cuda.OutOfMemoryError))
+            and (config.num_stages > 1 or config.kwargs.get("NUM_STAGES", 1) > 1)
+            and self.inductor_meta.get("dynamic_disable_pipelining", True)
+        ):
+            self.launchers = [self.compile_by_disabling_pipelining(config)]
+            return
+        raise RuntimeError(
+            f"No valid triton configs. {type(exc).__name__}: {exc}"
+        )
+
+    def _maybe_put_static_autotuner(
+        self, static_triton_bundle_key: str | None
+    ) -> None:
+        if static_triton_bundle_key is not None and self.is_statically_launchable():
+            TritonBundler.put_static_autotuner(static_triton_bundle_key, self)
+
+    def _bench_launchers(
+        self,
+        launchers: Iterable[LauncherType],
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[dict[LauncherType, float], int]:
+        """Bench each launcher and feed the coordesc cache. Returns
+        ``(timings, bench_ns)``; caller decides on the winner.
+        """
+        timings: dict[LauncherType, float] = {}
+        bench_ns = 0
+        for launcher in launchers:
+            t0 = time.time_ns()
+            timings[launcher] = self.bench(launcher, *args, **kwargs)
+            bench_ns += time.time_ns() - t0
+            self.coordesc_tuner.cache_benchmark_result(
+                launcher.config, timings[launcher]
+            )
+        return timings, bench_ns
+
+    def _finalize_autotune_winner(
+        self,
+        timings: dict[LauncherType, float],
+        autotune_time_taken_ns: int,
+    ) -> None:
+        """Pick the lowest-timing launcher as the sole survivor, register it
+        with ``TritonBundler.put_winner``, notify ``save_cache_hook``, and
+        record ``self.autotune_time_taken_ns``.
+        """
+        self.autotune_time_taken_ns = autotune_time_taken_ns
+        best_launcher = min(timings, key=timings.get)  # type: ignore[arg-type]
+        self.launchers = [best_launcher]
+        TritonBundler.put_winner(best_launcher.cache_hash)
+        if self.save_cache_hook is not None:
+            self.save_cache_hook(
+                best_launcher.config,
+                self.autotune_time_taken_ns,
+                found_by_coordesc=self.inductor_meta.get(
+                    "coordinate_descent_tuning", False
+                ),
+                triton_cache_hash=best_launcher.cache_hash,
+            )
 
     def _ensure_kernel_loaded(self) -> None:
         """Reload the kernel in the parent process if needed.
@@ -1449,9 +1640,11 @@ class CachingAutotuner(KernelInterface):
                     best_time,
                 )
 
-        self.launchers = [builtins.min(timings, key=timings.get)]
-        self.autotune_time_taken_ns = (
-            self.precompile_time_taken_ns + benchmark_time_taken_ns
+        self._finalize_autotune_winner(
+            timings,
+            autotune_time_taken_ns=(
+                self.precompile_time_taken_ns + benchmark_time_taken_ns
+            ),
         )
 
         # log the best config
@@ -1465,18 +1658,6 @@ class CachingAutotuner(KernelInterface):
             launcher.n_spills,
             launcher.shared,
         )
-
-        TritonBundler.put_winner(launcher.cache_hash)
-
-        if self.save_cache_hook:
-            self.save_cache_hook(
-                launcher.config,
-                self.autotune_time_taken_ns,
-                found_by_coordesc=self.inductor_meta.get(
-                    "coordinate_descent_tuning", False
-                ),
-                triton_cache_hash=launcher.cache_hash,
-            )
 
     def _combo_sequential_autotune(self, launcher, *args, **kwargs):
         """

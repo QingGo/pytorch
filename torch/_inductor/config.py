@@ -512,6 +512,11 @@ max_autotune_pointwise = os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE") 
 # enable slow autotuning passes to select gemm algorithms
 max_autotune_gemm = os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM") == "1"
 
+# Pipeline the CachingAutotuner: overlap triton compile, make_launcher, and benchmarking.
+pipeline_caching_autotuner: bool = (
+    os.environ.get("TORCHINDUCTOR_PIPELINE_CACHING_AUTOTUNER") == "1"
+)
+
 inductor_default_autotune_warmup = int(
     os.getenv("TORCHINDUCTOR_DEFAULT_AUTOTUNE_WARMUP", 25)
 )
