@@ -5,24 +5,23 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from typing import NamedTuple
 
 import torch
 from torch._inductor import config
-from torch._inductor.codegen.common import TritonScratchWorkspace
-from torch._inductor.codegen.cpp_wrapper_gpu import DeferredTritonCallWrapper
-from torch._inductor.codegen.cuda.device_op_overrides import CUDADeviceOpOverrides
 from torch._inductor.test_case import TestCase as InductorTestCase
-from torch._inductor.utils import IndentedBuffer
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
     slowTest,
 )
 from torch.testing._internal.inductor_utils import GPU_TYPE, RUN_GPU
+from torch.utils._triton import has_triton_tensor_descriptor_host_tma
 
 
 device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
+
 
 try:
     try:
@@ -88,66 +87,6 @@ class TestGpuWrapper(InductorTestCase):
         with torch.utils._device.DeviceContext(self.device):
             _, code = test_torchinductor.run_and_get_cpp_code(compiled, x, 3)
         self.assertIn("torch.tensor(arg, device='cpu')", code)
-
-    def test_cpp_scratch_scales_with_grid_size_for_tma(self):
-        if GPU_TYPE != "cuda" or torch.version.hip:
-            self.skipTest("CUDA-only codegen test")
-
-        scratch_def, scratch_var = CUDADeviceOpOverrides().cpp_scratch(
-            0,
-            TritonScratchWorkspace(
-                size=256, generate_dtype_str=lambda: "at::ScalarType::Byte"
-            ),
-            prefix="global_scratch",
-        )
-        self.assertEqual(scratch_var, "global_scratch_scratch_0")
-        self.assertIn(
-            "static_cast<int64_t>(256) * grid_0 * grid_1 * grid_2", scratch_def[0]
-        )
-
-    def test_triton_wrapper_scales_scratch_with_num_ctas(self):
-        if GPU_TYPE != "cuda" or torch.version.hip:
-            self.skipTest("CUDA-only codegen test")
-
-        class FakeWrapper:
-            device = "cuda"
-
-            def __init__(self):
-                self.scratch_spaces = None
-
-            def generate_args_decl(
-                self,
-                prefix,
-                call_args,
-                arg_types,
-                arg_signatures,
-                is_triton_kernel=True,
-                scratch_spaces=None,
-            ):
-                self.scratch_spaces = scratch_spaces
-
-                return ""
-
-        wrapper = FakeWrapper()
-        prefix = IndentedBuffer()
-        params = {
-            "triton_meta": {"signature": {"x": "*fp32"}, "constants": {}},
-            "def_args": ["x"],
-            "call_args": ["x"],
-            "config": {"num_ctas": 8},
-            "num_warps": 4,
-            "shared_mem": 0,
-            "global_scratch": 256,
-        }
-
-        DeferredTritonCallWrapper(
-            wrapper_name="wrapper",
-            kernel_name="kernel",
-            kernel_name_to_body={},
-            arg_types=[torch.float32],
-        ).generate_launch_kernel(prefix, wrapper, "kernel_var", params)
-
-        self.assertEqual(wrapper.scratch_spaces, {"global_scratch": 256 * 8})
 
     @parametrize("per_subkernel_blocks", [False, True])
     def test_lazy_compile_combo_kernel_default_config(self, per_subkernel_blocks):
@@ -413,6 +352,149 @@ class TestCppWrapperStaticInitDeadlock(InductorTestCase):
             r.returncode,
             0,
             f"Subprocess failed:\nstderr:\n{r.stderr[-2000:]}\nstdout:\n{r.stdout[-2000:]}",
+        )
+
+
+# Helper script for test_lazy_tma_global_scratch_scales_with_launch_grid
+# Run this repro in a subprocess because the regression can poison the CUDA context.
+_LAZY_TMA_GLOBAL_SCRATCH_SCRIPT = """\
+import torch
+import triton
+import triton.language as tl
+
+from torch._library import capture_triton
+
+
+M = 1048576
+N = 16
+BLOCK_M = 16
+BLOCK_N = 16
+
+
+def _alloc_scratch(size, alignment, stream):
+    return torch.empty(size, device="cuda", dtype=torch.uint8)
+
+
+triton.set_allocator(_alloc_scratch)
+
+
+@triton.jit
+def _tma_copy_kernel(
+    in_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    # Each CTA builds a different descriptor so one shared scratch slot is corrupt.
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr + pid * BLOCK_M * N,
+        shape=[BLOCK_M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    tile = in_desc.load([0, 0])
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    tl.store(out_ptr + offs_m[:, None] * N + offs_n[None, :], tile)
+
+
+@torch.library.triton_op("test_inductor::lazy_tma_scratch_copy", mutates_args={})
+def _tma_copy(x: torch.Tensor) -> torch.Tensor:
+    y = torch.empty_like(x)
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    capture_triton(_tma_copy_kernel)[grid](
+        x,
+        y,
+        M,
+        N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=8,
+        num_stages=4,
+    )
+    return y
+
+
+def run():
+    x = (torch.arange(M * N, device="cuda", dtype=torch.float32) % 100).to(
+        torch.float16
+    )
+    x = x.reshape(M, N)
+
+    def fn(x):
+        return _tma_copy(x)
+
+    eager = fn(x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(eager, x)
+
+    compiled = torch.compile(
+        fn,
+        fullgraph=True,
+        options={
+            "cpp_wrapper": True,
+            "triton.autotune_at_compile_time": False,
+        },
+    )
+    warmup = compiled(x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(warmup, x)
+    # The warmup lazy-compiles through Python; the second call uses the cached C++ launch.
+    out = compiled(x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x)
+
+
+run()
+"""
+
+
+class TestLazyTmaGlobalScratch(InductorTestCase):
+    device = GPU_TYPE
+
+    def test_lazy_tma_global_scratch_scales_with_launch_grid(self):
+        if not RUN_GPU:
+            self.skipTest("GPU not available")
+        if GPU_TYPE != "cuda" or torch.version.hip:
+            self.skipTest("requires CUDA")
+        if torch.cuda.get_device_capability()[0] < 9:
+            self.skipTest("requires Hopper or newer for TMA")
+        if not has_triton_tensor_descriptor_host_tma():
+            self.skipTest("requires Triton TensorDescriptor TMA support")
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            script_path = Path(cache_dir) / "lazy_tma_global_scratch_repro.py"
+            script_path.write_text(_LAZY_TMA_GLOBAL_SCRATCH_SCRIPT, encoding="utf-8")
+            env = {
+                **os.environ,
+                "CUDA_LAUNCH_BLOCKING": "1",
+                "INDUCTOR_TEST_DISABLE_FRESH_CACHE": "1",
+                "TORCHINDUCTOR_CACHE_DIR": cache_dir,
+            }
+            result = subprocess.run(
+                [sys.executable, str(script_path)],
+                capture_output=True,
+                cwd=cache_dir,
+                text=True,
+                env=env,
+                timeout=180,
+            )
+
+        stderr_tail = "\n".join(result.stderr.splitlines()[-80:])
+        self.assertEqual(
+            result.returncode,
+            0,
+            "lazy TMA scratch regression subprocess failed:\n"
+            f"returncode: {result.returncode}\n"
+            f"stderr tail:\n{stderr_tail}",
         )
 
 
