@@ -7421,7 +7421,11 @@ def sort_stable(x, *, stable=None, dim=-1, descending=False):
         idx_dtype = torch.int32
     else:
         idx_dtype = torch.int16
-    if not V.graph.sizevars.statically_known_lt(dim_size, torch.iinfo(idx_dtype).max):
+    if not V.graph.sizevars.statically_known_lt(
+        dim_size, torch.iinfo(idx_dtype).max
+    ) and not V.graph.sizevars.guard_or_true(
+        sympy.Lt(dim_size, torch.iinfo(idx_dtype).max)
+    ):
         return sort_fallback(x, stable=stable, dim=dim, descending=descending)
 
     indices = iota(

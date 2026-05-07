@@ -325,13 +325,18 @@ class FxConverter:
         stride: tuple[Any, ...],
         offset: int | sympy.Expr,
     ) -> torch.fx.Node:
+        offset_node = self._generate_sym_node(offset)
+        if isinstance(offset_node, torch.fx.Node) and isinstance(
+            offset_node.meta.get("val"), torch.SymFloat
+        ):
+            offset_node.meta["val"] = torch.sym_int(offset_node.meta["val"])
         return self.gm.graph.call_function(
             torch.as_strided,
             args=(
                 input_node,
                 self._generate_sym_nodes(size),
                 self._generate_sym_nodes(stride),
-                self._generate_sym_node(offset),
+                offset_node,
             ),
         )
 
