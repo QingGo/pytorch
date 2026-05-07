@@ -514,13 +514,10 @@ class TritonTemplateKernel(TritonKernel):
         triton_meta: dict[str, object] | None = None,
         always_freeze_layout: bool = False,
     ) -> None:
-        tma_2d = tma_store or tma_load_for_template_epilogue
-        if tma_store:
-            pass
         numel = sympy_product(output_node.get_size())
-        if tma_2d:
+        if tma_store or tma_load_for_template_epilogue:
             assert len(output_node.get_size()) == 2, (
-                "TMA load/store only supported for 2D with templates"
+                "TMA load/store only supported for 2D output with templates"
             )
             tiling = {
                 "x": output_node.get_size()[0],
@@ -537,7 +534,7 @@ class TritonTemplateKernel(TritonKernel):
             features=SIMDKernelFeatures([], numel),
             hint_override=hint_override,
         )
-        if tma_2d:
+        if tma_store or tma_load_for_template_epilogue:
             # By default `construct_range_trees` will return the range_trees in the order
             # ["z", "y", "x", "r0_", "r1_"] (see simd.py:all_prefixes)
             # and this order defines what the kernel block shape will be. So if the template
