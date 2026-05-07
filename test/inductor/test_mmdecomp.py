@@ -361,6 +361,107 @@ instantiate_device_type_tests(
     TestDecomp, globals(), only_for=device_types, allow_xpu=True
 )
 
+
+def _mtia_device_available() -> bool:
+    """MTIA backend is registered in core but may not be available in CI.
+
+    FakeTensorMode only needs ``torch.device("mtia")`` to be a valid descriptor;
+    no hardware or driver is required. This guard exists for environments where
+    the MTIA backend isn't compiled in at all.
+    """
+    try:
+        torch.device("mtia")
+    except (RuntimeError, TypeError):
+        return False
+    return True
+
+
+@unittest.skipIf(not _mtia_device_available(), "MTIA backend not registered")
+class TestBmmDecompMTIA(NNTestCase):
+    """MTIA must keep matvec-shaped torch.bmm as a real matmul so the
+    Triton-MTIA backend can lower it to ``tt.dot`` (which uses the on-chip
+    DPE). The Inductor bmm decomposition rewrites these into
+    ``unsqueeze + broadcast mul + sum``, which is the exact pattern the
+    ``RecognizeMatvecPattern`` MTIA pass exists to undo. Disabling that
+    decomposition for MTIA lets us emit ``tt.dot`` directly and lets the
+    MTIA-side pass be retired.
+
+    These tests pin that contract: ``decomp_bmm`` must return
+    ``NotImplemented`` for matvec-shaped inputs on MTIA so Inductor falls
+    through to the matmul lowering.
+    """
+
+    def _fake_mtia_tensor(self, fake_mode, shape, dtype=torch.float32):
+        with fake_mode:
+            return torch.empty(shape, device="mtia", dtype=dtype)
+
+    @config.patch(coordinate_descent_tuning=True)
+    def test_bmm_m_is_one_mtia_not_decomposed(self):
+        # Matvec shape: [B, 1, K] x [B, K, N] — must stay as bmm so the
+        # downstream lowering can emit tt.dot on MTIA.
+        fake_mode = FakeTensorMode()
+        t1 = self._fake_mtia_tensor(fake_mode, (4, 1, 128))
+        t2 = self._fake_mtia_tensor(fake_mode, (4, 128, 64))
+
+        with fake_mode:
+            out = decomp_bmm(t1, t2)
+
+        self.assertIs(out, NotImplemented)
+
+    @config.patch(coordinate_descent_tuning=True)
+    def test_bmm_n_is_one_mtia_not_decomposed(self):
+        # Matvec shape: [B, M, K] x [B, K, 1] — must stay as bmm.
+        fake_mode = FakeTensorMode()
+        t1 = self._fake_mtia_tensor(fake_mode, (4, 64, 128))
+        t2 = self._fake_mtia_tensor(fake_mode, (4, 128, 1))
+
+        with fake_mode:
+            out = decomp_bmm(t1, t2)
+
+        self.assertIs(out, NotImplemented)
+
+    @config.patch(coordinate_descent_tuning=True)
+    def test_bmm_normal_shape_mtia_not_decomposed(self):
+        # Regression: for non-matvec shapes the decomposition already
+        # returns NotImplemented. Pin that nothing changed for MTIA in the
+        # regular case so we keep going through the matmul lowering.
+        fake_mode = FakeTensorMode()
+        t1 = self._fake_mtia_tensor(fake_mode, (4, 64, 128))
+        t2 = self._fake_mtia_tensor(fake_mode, (4, 128, 64))
+
+        with fake_mode:
+            out = decomp_bmm(t1, t2)
+
+        self.assertIs(out, NotImplemented)
+
+    def test_bmm_outer_product_k_is_one_mtia_still_decomposed(self):
+        # The K=1 outer-product specialization is universally beneficial
+        # (no reduction to recover) and should stay enabled for MTIA. This
+        # branch ignores coordinate_descent_tuning and device.type, so MTIA
+        # tensors should still hit it.
+        fake_mode = FakeTensorMode()
+        t1 = self._fake_mtia_tensor(fake_mode, (4, 8, 1))
+        t2 = self._fake_mtia_tensor(fake_mode, (4, 1, 16))
+
+        with fake_mode:
+            out = decomp_bmm(t1, t2)
+
+        self.assertIsNot(out, NotImplemented)
+
+    @unittest.skipIf(not HAS_GPU, "regression check requires a real GPU device")
+    @config.patch(coordinate_descent_tuning=True)
+    def test_bmm_matvec_gpu_still_decomposed(self):
+        # Regression: MTIA gating must NOT disable the matvec decomposition
+        # for CUDA/XPU. Confirm the GPU path still decomposes, otherwise we
+        # silently regressed coordinate_descent_tuning behavior on GPU.
+        t1 = torch.randn(4, 1, 128, device=GPU_TYPE)
+        t2 = torch.randn(4, 128, 64, device=GPU_TYPE)
+
+        out = decomp_bmm(t1, t2)
+
+        self.assertIsNot(out, NotImplemented)
+
+
 if __name__ == "__main__":
     # We don't support torch.compile() on Windows
     if not IS_WINDOWS:
