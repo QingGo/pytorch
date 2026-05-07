@@ -767,6 +767,8 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             return self.nb_int_impl(tx)
         elif name == "__float__" and not args and not kwargs:
             return self.nb_float_impl(tx)
+        elif name == "__abs__" and not args and not kwargs:
+            return self.nb_absolute_impl(tx)
         elif name == "__get__" and len(args) in (1, 2) and not kwargs:
             # Route to tp_descr_get_impl if the VT implements it.
             # Mirrors slot_tp_descr_get which calls __get__(self, obj, type).
@@ -1253,6 +1255,23 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             context=f"{type(self).__name__} has nb_positive slot but no nb_positive_impl override",
             explanation=f"The type {self.python_type_name()} has an nb_positive C slot but "
             "the corresponding VariableTracker doesn't implement nb_positive_impl.",
+            hints=[*graph_break_hints.SUPPORTABLE],
+        )
+
+    def nb_absolute_impl(
+        self,
+        tx: Any,
+    ) -> VariableTracker:
+        """Mirrors CPython's tp_as_number->nb_absolute slot.
+
+        Called when type_implements_nb_absolute returns True for this type.
+        Subclasses override to provide the actual absolute value.
+        """
+        unimplemented(
+            gb_type="nb_absolute_impl not implemented",
+            context=f"{type(self).__name__} has nb_absolute slot but no nb_absolute_impl override",
+            explanation=f"The type {self.python_type_name()} has an nb_absolute C slot but "
+            "the corresponding VariableTracker doesn't implement nb_absolute_impl.",
             hints=[*graph_break_hints.SUPPORTABLE],
         )
 
