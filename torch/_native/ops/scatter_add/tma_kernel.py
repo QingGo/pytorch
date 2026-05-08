@@ -86,9 +86,11 @@ def _reduce_op_for(dtype):
     raise ValueError(f"unsupported dtype: {dtype}")
 
 
-def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op, contig: bool):
+def _make_kernel(
+    dtype, elem_bytes: int, chunk_elems: int, reduce_op, contig: bool, scale: bool
+):
     """Build a dtype-specialized kernel closure. dtype/elem_bytes/chunk_elems
-    /contig are Python-time constants that the preprocessor folds at
+    /contig/scale are Python-time constants that the preprocessor folds at
     cute.compile time.
 
     ``chunk_elems`` is baked in at compile time. The TMA descriptor
@@ -108,6 +110,13 @@ def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op, contig: bo
     ``out_row_stride`` arg so outer-strided outputs (e.g. slices) work.
     The TMA load always goes through the descriptor and doesn't use
     ``contig``.
+
+    When ``scale`` is True, after ``consumer_wait`` the driver thread
+    multiplies the chunk_elems smem buffer in place before the
+    bulk-reduce, followed by ``fence_view_async_shared`` so the
+    bulk-reduce sees the scaled values through the async proxy. The
+    ``alpha == 1`` fast path uses ``scale=False`` and avoids the smem
+    pass + proxy fence entirely.
     """
 
     chunk_bytes = chunk_elems * elem_bytes
@@ -122,6 +131,7 @@ def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op, contig: bo
         D: Int32,
         chunk_tile_size: Int32,  # number of chunks per grid_y slot
         out_row_stride: Int64,
+        alpha: cute.Numeric,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
@@ -200,6 +210,21 @@ def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op, contig: bo
                     pipe.consumer_wait(consumer_state)
                     cbuf_ptr = sBuf.iterator + consumer_state.index * Int32(chunk_elems)
 
+                    if const_expr(scale):
+                        # Scale smem in place before the bulk-reduce.
+                        # Only lane 0 needs to touch it (single-warp
+                        # pipeline + reduce is lane-0 gated anyway), then
+                        # fence_view_async_shared releases the generic
+                        # write to the async proxy so the bulk-reduce
+                        # sees the scaled values.
+                        alpha_t = dtype(alpha)
+                        for i in cutlass.range_constexpr(chunk_elems):
+                            slot = cute.make_tensor(
+                                cbuf_ptr + Int32(i), cute.make_layout(1)
+                            )
+                            slot[0] = slot[0] * alpha_t
+                        cute.arch.fence_view_async_shared()
+
                     # Partial-chunk handling: actual valid element count
                     # is min(chunk_elems, D - off). TMA OOB-clamped the
                     # tail to 0 in smem, we reduce only the valid bytes.
@@ -234,6 +259,7 @@ def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op, contig: bo
         grid_x: Int32,
         grid_y: Int32,
         out_row_stride: Int64,
+        alpha: cute.Numeric,
     ):
         # Build the tile-mode TMA descriptor. Shape (M_src, N) comes
         # from mSrc; TMA clamps OOB column reads to 0, so rows with
@@ -253,6 +279,7 @@ def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op, contig: bo
             D,
             chunk_tile_size,
             out_row_stride,
+            alpha,
         ).launch(
             grid=[grid_x, grid_y, 1],
             block=[_THREADS_PER_CTA, 1, 1],
@@ -276,13 +303,19 @@ def _chunk_elems_for(torch_dtype: torch.dtype, N: int) -> int:
     return chunk_bytes // elem_bytes
 
 
+def _alpha_dtype_for(torch_dtype: torch.dtype):
+    """Alpha is passed as fp32 across the ABI; tvm_ffi doesn't support
+    fp16/bf16 scalar args. Kernel casts to src dtype inside."""
+    return Float32
+
+
 @jit_cache
-def _compile_tma_scatter(torch_dtype: torch.dtype, N: int, contig: bool):
+def _compile_tma_scatter(torch_dtype: torch.dtype, N: int, contig: bool, scale: bool):
     dtype = _TORCH_TO_CUTE[torch_dtype]
     elem_bytes = dtype.width // 8
     chunk_elems = _chunk_elems_for(torch_dtype, N)
     reduce_op = _reduce_op_for(dtype)
-    launcher = _make_kernel(dtype, elem_bytes, chunk_elems, reduce_op, contig)
+    launcher = _make_kernel(dtype, elem_bytes, chunk_elems, reduce_op, contig, scale)
 
     mSrc_fake = cute.runtime.make_fake_tensor(
         dtype, (cute.sym_int(), N), stride=(cute.sym_int64(), 1)
@@ -293,6 +326,7 @@ def _compile_tma_scatter(torch_dtype: torch.dtype, N: int, contig: bool):
     mOut_fake = cute.runtime.make_fake_tensor(
         dtype, (cute.sym_int(), N), stride=(cute.sym_int64(), 1)
     )
+    alpha_dtype = _alpha_dtype_for(torch_dtype)
     return cute.compile(
         launcher,
         mSrc_fake,
@@ -305,6 +339,7 @@ def _compile_tma_scatter(torch_dtype: torch.dtype, N: int, contig: bool):
         Int32(0),
         Int32(0),
         Int64(0),
+        alpha_dtype(0.0),
         options="--enable-tvm-ffi",
     )
 
@@ -364,21 +399,27 @@ def tma_scatter_add_into(
     out: torch.Tensor,
     index_1d: torch.Tensor,
     src: torch.Tensor,
+    alpha: float = 1.0,
 ) -> None:
-    """In-place: ``out[index_1d[i], :] += src[i, :]`` for every i.
+    """In-place: ``out[index_1d[i], :] += alpha * src[i, :]`` for every i.
 
     ``out`` / ``src`` are 2D with inner-dim stride 1 (outer row stride
     can differ from N, e.g. a slice of a wider buffer). ``index_1d`` is
     1D int64 of length M_src. ``row_bytes = N * elem_size`` must be a
     multiple of 16; the host cond enforces this.
+
+    ``alpha == 1.0`` dispatches to the non-scaling variant (no smem
+    scale pass, no proxy fence).
     """
     M, N = src.shape
     chunk_elems = _chunk_elems_for(src.dtype, N)
     contig = src.stride(0) == N and out.stride(0) == N
-    compiled = _compile_tma_scatter(src.dtype, N, contig)
+    scale = alpha != 1.0
+    compiled = _compile_tma_scatter(src.dtype, N, contig, scale)
     sm = torch.cuda.get_device_properties(out.device).multi_processor_count
 
     grid_x, grid_y, chunk_tile_size = _plan_grid(M, N, chunk_elems, sm)
+    alpha_dtype = _alpha_dtype_for(src.dtype)
     compiled(
         src,
         index_1d,
@@ -389,4 +430,5 @@ def tma_scatter_add_into(
         grid_x,
         grid_y,
         out.stride(0),
+        alpha_dtype(float(alpha)),
     )
