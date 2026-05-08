@@ -36,6 +36,7 @@ ScalingType.__module__ = "torch.nn.functional"
 SwizzleType.__module__ = "torch.nn.functional"
 
 if TYPE_CHECKING:
+    from torch.nn.modules.linear_cross_entropy import LinearCrossEntropyOptions
     from torch.types import _dtype as DType
 else:
     # The JIT doesn't understand Union, nor torch.dtype here
@@ -3662,6 +3663,7 @@ def linear_cross_entropy(
     reduction: str = "mean",
     ignore_index: int | None = None,
     label_smoothing: float = 0.0,
+    options: "LinearCrossEntropyOptions | None" = None,
 ) -> Tensor:
     r"""Compute the cross entropy loss between inputs, transformed linearly, and target.
 
@@ -3709,7 +3711,13 @@ def linear_cross_entropy(
             Architecture for Computer Vision
             <https://arxiv.org/abs/1512.00567>`__.
             Default: :math:`0.0`.
-
+        options (LinearCrossEntropyOptions, optional): Specify
+            chunking strategy options, see
+            :class:`~torch.nn.LinearCrossEntropyOptions`
+            for more details. Enabling chunking will decrease the
+            memory usage.  To enable reference implementation of
+            ``linear_cross_entropy``, use `options=None`. Default:
+            ``None``.
     Shape:
         - Input: :math:`(in_features)` or :math:`(N, in\_features)`.
         - Linear weight: :math:`(C, in\_features)` or :math:`(C, d_1,
@@ -3750,6 +3758,7 @@ def linear_cross_entropy(
             reduction=reduction,
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
+            options=options,
         )
     if input.dim() < 1 or input.dim() > 2:
         raise RuntimeError(
@@ -3785,11 +3794,59 @@ def linear_cross_entropy(
         )
     ignore_index = ignore_index if ignore_index is not None else -100
 
+    # K-dim loss (out_features != ()) falls back to the reference
+    # cross_entropy: the chunked op runs softmax over the full
+    # linear_weight.shape[0], not per-position over the num_classes
+    # axis.
+    if (
+        options is not None
+        and reduction in {"mean", "sum"}
+        and label_smoothing == 0.0
+        and target.dtype == torch.int64
+        and not out_features
+    ):
+        if input.dim() == 2:
+            num_batches = input.shape[0]
+            has_batches = True
+        else:
+            num_batches = 1
+            has_batches = False
+            input = input.unsqueeze(0)
+            target = target.unsqueeze(0)
+
+        options = options._adjust(num_batches, in_features, num_classes, input.dtype)
+
+        # Local import: a top-level import here would trigger
+        # a circular init through torch.library.custom_op.
+        from torch.nn.modules.linear_cross_entropy import (
+            _linear_cross_entropy_batch_chunked,
+        )
+
+        result = _linear_cross_entropy_batch_chunked(
+            input,
+            linear_weight,
+            target,
+            weight,
+            reduction,
+            ignore_index,
+            label_smoothing,
+            options.batch_chunk_size,
+            options.acc_policy,
+            options.acc_dtype,
+            options.allow_retain_graph,
+            input.requires_grad,
+            linear_weight.requires_grad,
+        )[0]
+
+        if not has_batches:
+            result = result.squeeze(0)
+        return result
+
     if out_features:
-        # reshape linear_weight to 2D required by linear
         linear_weight = linear_weight.reshape(
             (math.prod(out_features, start=num_classes), in_features)
         )
+
     logits = linear(input, linear_weight)
     # recover logits shape that corresponds to the shape of specified
     # linear_weight:
