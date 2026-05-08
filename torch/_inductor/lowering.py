@@ -2750,11 +2750,26 @@ make_fallback(aten.rand_like, override_decomp=True)
 make_fallback(aten.randn_like, override_decomp=True)
 make_fallback(aten.randint_like, override_decomp=True)
 
-# TODO: mlazos reevaluate if we want to codegen something different
+# Registered as fallbacks so the cpp_wrapper / AOTI codegen path sees them.
+# These are non-aten custom ops, so ``FallbackKernel.codegen`` routes them
+# through ``generate_fallback_kernel_with_runtime_lookup`` (proxy-executor
+# path). ``CppWrapperGpu`` intercepts them there and emits inline CUDA
+# driver calls instead of going through the (nonexistent) proxy executor.
+#
+# Also register them in ``_side_effectful_functions`` here (in addition to
+# the registration in ``_dynamo/variables/streams.py``), so Inductor's DCE
+# preserves them even when Dynamo isn't loaded — e.g., for non-strict
+# ``torch.export.export()`` flows that build the graph without importing
+# Dynamo's stream-tracing module.
+from torch.fx.node import has_side_effect as _has_side_effect
+
+_has_side_effect(torch.ops.streams.record_event.default)
+_has_side_effect(torch.ops.streams.wait_event.default)
+_has_side_effect(torch.ops.streams.synchronize_event.default)
+
 make_fallback(torch.ops.streams.record_event.default)
 make_fallback(torch.ops.streams.wait_event.default)
 make_fallback(torch.ops.streams.synchronize_event.default)
-make_fallback(torch.ops.streams.synchronize_device.default)
 
 
 @register_lowering(aten.rand)

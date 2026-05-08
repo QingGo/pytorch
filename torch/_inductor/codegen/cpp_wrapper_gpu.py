@@ -32,6 +32,7 @@ from ..utils import (
     XPU_KERNEL_FORMAT,
 )
 from ..virtualized import V
+from ..stream_utils import get_stream_name
 from .aoti_hipify_utils import maybe_hipify_code_wrapper
 from .common import get_device_op_overrides, TritonScratchWorkspace
 from .cpp_utils import cexpr
@@ -815,6 +816,8 @@ class CppWrapperGpu(CppWrapperCpu):
         self._triton_call_wrappers: dict[str, DeferredTritonCallWrapper] = {}
         self.autotune_input_prefix = "_REAL_AUTOTUNE_INPUT"
         self._lazy_kernel_names: list[str] = []
+        self._declared_aux_stream_slots: set[int] = set()
+        self._aoti_current_stream_guard_declared = False
 
     @staticmethod
     def create(
@@ -852,6 +855,364 @@ class CppWrapperGpu(CppWrapperCpu):
             f"AOTI_TORCH_ERROR_CODE_CHECK({self.device_codegen.aoti_get_stream()}({device_idx}, (void**)&{name}));"
         )
         return name
+
+    def codegen_stream_info_prologue(
+        self,
+        code: IndentedBuffer,
+        num_streams: int,
+        stream_idx_to_user_obj_idx: dict[int, int],
+    ) -> None:
+        """Declare aux stream handles after the device context guard.
+
+        Slot 0 is the AOTI ``stream`` parameter (the caller-passed current
+        stream); aux slots are pulled from a per-thread TLS cache backed by
+        indexed storage. The prologue pre-creates the known compiler/user
+        stream slots once per thread and reuses them across Run() calls.
+        """
+        if num_streams <= 1 or not V.graph.aot_mode:
+            # JIT cpp_wrapper + multi-stream is a separate, currently
+            # unsupported path. Skipping preserves the pre-existing behavior
+            # (multi-stream cpp_wrapper for JIT was never wired up).
+            return
+        self._ensure_multi_stream_helpers_emitted()
+        code.writeline(
+            f"_aoti_aux_stream_cache.ensure({num_streams}, this->device_idx_);"
+        )
+        if not getattr(self, "_aoti_current_stream_guard_declared", False):
+            code.writeline(
+                f"std::unique_ptr<{V.graph.device_ops.cpp_aoti_stream_guard()}> "
+                "_aoti_current_stream_guard;"
+            )
+            self._aoti_current_stream_guard_declared = True
+        # Re-entering the device guard (e.g. after a CPU op like ``.item()``)
+        # invokes this prologue again. ``ExitDeviceContextManagerLine`` is a
+        # no-op in cpp_wrapper, so the original ``cudaStream_t streamN`` is
+        # still in scope and a redeclaration is a hard C++ error. Track which
+        # aux slots we've already emitted in this Run() function and skip them.
+        declared = self._declared_aux_stream_slots
+        stream_type = self.device_codegen.cpp_stream_type()
+        for i in range(1, num_streams):
+            if i in declared:
+                continue
+            name = get_stream_name(i)
+            code.writeline(
+                maybe_hipify_code_wrapper(
+                    f"{stream_type} {name} = _aoti_aux_stream_cache.get("
+                    f"{i}, this->device_idx_);"
+                )
+            )
+            declared.add(i)
+
+    def _check_cudagraph_compatibility(self) -> None:
+        """Guard: multi-stream codegen is not compatible with cudagraphs.
+
+        Aux streams are created via ``cudaStreamCreateWithFlags`` in the
+        per-thread TLS cache. If creation happens during cudagraph capture
+        (rather than warmup), the stream is not part of the captured graph
+        and replay is undefined behavior. Bail at compile time when
+        ``config.triton.cudagraphs`` is enabled.
+
+        **Limitation:** this only fires for JIT cpp_wrapper compile flows
+        where ``config.triton.cudagraphs`` is explicitly set. For AOTI
+        compile, cudagraphs are purely a runtime concern — the user
+        captures by wrapping ``Run()`` in ``torch.cuda.graph(...)`` after
+        loading the artifact. AOTI compile never sees the cudagraph intent,
+        so this guard cannot catch that case. A runtime check via
+        ``cudaStreamIsCapturing`` inside ``AOTIPerThreadStreamCache::get``
+        is the right protection there — tracked as a follow-up.
+        See AOTI multi-stream design doc Appendix D #7.
+        """
+        if config.triton.cudagraphs:
+            raise NotImplementedError(
+                "Multi-stream cpp_wrapper codegen is not compatible with "
+                "cudagraphs. The per-thread aux-stream cache creates "
+                "streams, which breaks cudagraph capture. Disable cudagraphs "
+                "(set config.triton.cudagraphs = False) or remove "
+                "torch.cuda.Stream / torch.ops.streams.* usage from the "
+                "model. Tracking work to lift this restriction lives in the "
+                "AOTI multi-stream design doc (Plan 01 §Step 8)."
+            )
+
+    def _ensure_multi_stream_helpers_emitted(self) -> None:
+        """Inject the per-thread stream/event cache helper structs into the
+        wrapper.cpp header, once per generated file. Definitions live in an
+        anonymous namespace to keep them artifact-local.
+        """
+        if getattr(self, "_multi_stream_helpers_emitted", False):
+            return
+        self._check_cudagraph_compatibility()
+        self._multi_stream_helpers_emitted = True
+        self.header.splice(
+            """
+            #include <cstddef>
+            #include <vector>
+
+            namespace {
+
+            struct AOTIPerThreadEventCache {
+                std::vector<cudaEvent_t> events;
+
+                void create(std::size_t slot) {
+                    AOTI_RUNTIME_CUDA_CHECK(cudaEventCreateWithFlags(
+                        &events[slot], cudaEventDisableTiming));
+                }
+
+                void ensure(std::size_t count) {
+                    const std::size_t old_size = events.size();
+                    if (old_size >= count) return;
+                    events.resize(count, nullptr);
+                    for (std::size_t i = old_size; i < count; ++i) {
+                        if (i == 0) continue;
+                        create(i);
+                    }
+                }
+
+                cudaEvent_t get(int idx) {
+                    const std::size_t slot = static_cast<std::size_t>(idx);
+                    ensure(slot + 1);
+                    if (events[slot] == nullptr) create(slot);
+                    return events[slot];
+                }
+
+                ~AOTIPerThreadEventCache() {
+                    // Best-effort cleanup at thread exit; swallow errors
+                    // since destructors must not throw and CUDA may already
+                    // be tearing down.
+                    for (auto event : events) {
+                        if (event != nullptr) (void)cudaEventDestroy(event);
+                    }
+                }
+            };
+
+            struct AOTIPerThreadStreamCache {
+                std::vector<cudaStream_t> streams;
+
+                void ensure(std::size_t count, int /*device_idx*/) {
+                    // device_idx is unused for now: cudaStream is bound to
+                    // the current device at creation time, and the caller
+                    // sets the device via AOTICudaGuard before this runs.
+                    const std::size_t old_size = streams.size();
+                    if (old_size >= count) return;
+                    streams.resize(count, nullptr);
+                    for (std::size_t i = old_size; i < count; ++i) {
+                        if (i == 0) continue;
+                        AOTI_RUNTIME_CUDA_CHECK(cudaStreamCreateWithFlags(
+                            &streams[i], cudaStreamNonBlocking));
+                    }
+                }
+
+                cudaStream_t get(int idx, int device_idx) {
+                    const std::size_t slot = static_cast<std::size_t>(idx);
+                    ensure(slot + 1, device_idx);
+                    return streams[slot];
+                }
+
+                ~AOTIPerThreadStreamCache() {
+                    for (auto stream : streams) {
+                        if (stream != nullptr) (void)cudaStreamDestroy(stream);
+                    }
+                }
+            };
+
+            static thread_local AOTIPerThreadEventCache _aoti_event_cache;
+            static thread_local AOTIPerThreadStreamCache _aoti_aux_stream_cache;
+
+            }  // namespace
+            """
+        )
+
+    def codegen_enter_cuda_stream_context(
+        self, code: IndentedBuffer, stream_idx: int
+    ) -> None:
+        """Set the current C++ CUDA stream without introducing a scope.
+
+        Triton kernels receive the target stream explicitly, but extern calls
+        through ATen/AOTI shims use PyTorch's current stream.  A nullable guard
+        gives extern calls the same stream assignment while avoiding braces
+        that would hide local buffer declarations from later code.
+        """
+        if stream_idx == 0:
+            # Switching from a side stream to the default/caller stream already
+            # resets the guard in codegen_exit_cuda_stream_context().
+            return
+        code.writeline(
+            "_aoti_current_stream_guard = "
+            f"std::make_unique<{V.graph.device_ops.cpp_aoti_stream_guard()}>("
+            f"{self._stream_expr_for_idx(stream_idx)}, this->device_idx_);"
+        )
+
+    def codegen_exit_cuda_stream_context(self, code: IndentedBuffer) -> None:
+        """Restore the caller/default stream for cpp_wrapper stream contexts."""
+        code.writeline("_aoti_current_stream_guard.reset();")
+
+    _STREAM_OP_NAMES: dict[str, str] = {
+        "torch.ops.streams.record_event.default": "record_event",
+        "torch.ops.streams.wait_event.default": "wait_event",
+    }
+
+    # Stream ops that exist in the FX graph but are intentionally not
+    # supported in AOTI cpp_wrapper. Bail at compile time with a clear
+    # message instead of silently falling through to the proxy executor
+    # (which would fail at runtime with a less helpful error).
+    _UNSUPPORTED_STREAM_OPS: dict[str, str] = {
+        "torch.ops.streams.synchronize_stream.default": (
+            "Host-blocking sync ops should not appear inside an AOTI "
+            "Run() — the caller is responsible for synchronizing before "
+            "reading outputs. Replace with explicit record_event + "
+            "wait_event for cross-stream ordering, or remove if not needed."
+        ),
+        "torch.ops.streams.synchronize_event.default": (
+            "Host-blocking sync ops should not appear inside an AOTI "
+            "Run() — the caller is responsible for synchronizing. "
+            "Replace with stream.wait_event(e) for GPU-side ordering."
+        ),
+        "torch.ops.streams.synchronize_device.default": (
+            "Host-blocking sync ops should not appear inside an AOTI "
+            "Run() — synchronizing the entire device blocks every CUDA "
+            "stream and the calling thread. The caller is responsible "
+            "for any host-side synchronization."
+        ),
+        "torch.ops.streams.wait_stream.default": (
+            "wait_stream is not supported in AOTI cpp_wrapper. Replace "
+            "with explicit record_event on the waited-on stream + "
+            "wait_event on the waiting stream."
+        ),
+    }
+
+    def _emit_stream_op_inline(
+        self, kernel_name: str | None, args: list[str]
+    ) -> bool:
+        """Special-case ``torch.ops.streams.*`` to emit inline CUDA driver
+        calls. Returns True if handled, False to fall back to the default
+        extern-kernel codegen path.
+
+        Raises ``NotImplementedError`` for stream ops that are intentionally
+        not supported (host-blocking syncs, ``wait_stream``).
+
+        AOT-only: the helpers (`_aoti_event_cache`) live in the wrapper file
+        which is only fully formed for AOT mode.
+        """
+        if kernel_name is None or not V.graph.aot_mode:
+            return False
+        if kernel_name in self._UNSUPPORTED_STREAM_OPS:
+            raise NotImplementedError(
+                f"{kernel_name} is not supported in AOTI cpp_wrapper. "
+                f"{self._UNSUPPORTED_STREAM_OPS[kernel_name]}"
+            )
+        op = self._STREAM_OP_NAMES.get(kernel_name)
+        if op is None:
+            return False
+
+        def _parse_idx(arg: str) -> int:
+            # cpp_wrapper formats integer args as C-style literals (e.g. ``1L``).
+            return int(arg.rstrip("Ll"))
+
+        def _stream_expr(idx: int) -> str:
+            """C++ expression yielding the cudaStream_t for `idx`.
+
+            Slot 0 is the AOTI ``stream`` parameter; aux slots come from the
+            per-thread TLS cache (which we ensure is declared). Resolving via
+            the cache means we don't depend on the prologue declaring stream
+            variables, which only fires when the scheduler sees multi-stream
+            FX-level annotations.
+            """
+            if idx == 0:
+                return "stream"
+            return f"_aoti_aux_stream_cache.get({idx}, this->device_idx_)"
+
+        # record_event / wait_event reference events from the per-thread
+        # cache; ensure the helper structs are declared in the file.
+        self._ensure_multi_stream_helpers_emitted()
+
+        if op == "record_event":
+            event_idx = _parse_idx(args[0])
+            stream_idx = _parse_idx(args[1])
+            self.record_aoti_cuda_call(
+                "event_record",
+                target="cudaEventRecord",
+                stream_idx=stream_idx,
+                metadata={"event_idx": event_idx},
+            )
+            self.writeline(
+                f"AOTI_RUNTIME_CUDA_CHECK(cudaEventRecord("
+                f"_aoti_event_cache.get({event_idx}), "
+                f"{_stream_expr(stream_idx)}));"
+            )
+            return True
+
+        if op == "wait_event":
+            event_idx = _parse_idx(args[0])
+            stream_idx = _parse_idx(args[1])
+            self.record_aoti_cuda_call(
+                "event_wait",
+                target="cudaStreamWaitEvent",
+                stream_idx=stream_idx,
+                metadata={"event_idx": event_idx},
+            )
+            self.writeline(
+                f"AOTI_RUNTIME_CUDA_CHECK(cudaStreamWaitEvent("
+                f"{_stream_expr(stream_idx)}, "
+                f"_aoti_event_cache.get({event_idx}), 0));"
+            )
+            return True
+
+        return False
+
+    def _stream_expr_for_idx(self, stream_idx: int) -> str:
+        """C++ expression yielding the cudaStream_t for stream slot
+        `stream_idx`. Slot 0 is the AOTI ``stream`` parameter; aux slots
+        come from the per-thread stream cache."""
+        if stream_idx == 0:
+            return "stream"
+        return f"_aoti_aux_stream_cache.get({stream_idx}, this->device_idx_)"
+
+    def _generate_extern_kernel_alloc_helper(self, extern_kernel, args):
+        kernel_name = getattr(extern_kernel, "python_kernel_name", None)
+        if self._emit_stream_op_inline(kernel_name, args):
+            # Same wrapper.json sync issue as in
+            # ``generate_fallback_kernel_with_runtime_lookup``. See that
+            # method's docstring for context.
+            if V.extern_kernel_nodes:
+                V.extern_kernel_nodes.pop()
+            return
+        super()._generate_extern_kernel_alloc_helper(extern_kernel, args)
+
+    def generate_fallback_kernel_with_runtime_lookup(
+        self,
+        buf_name,
+        python_kernel_name,
+        get_args,
+        op_overload,
+        raw_args,
+        outputs,
+    ):
+        """For non-aten ops, ``FallbackKernel.codegen`` routes through this
+        method (proxy-executor path) instead of the simpler
+        ``generate_fallback_kernel``. Intercept ``torch.ops.streams.*`` here
+        to emit inline CUDA driver calls; everything else falls through to
+        the parent's runtime-lookup path.
+
+        ``FallbackKernel.codegen`` calls ``export_extern_kernel_node()``
+        before getting here, which appends an entry to ``V.extern_kernel_nodes``
+        (later serialized into ``wrapper.json``). When we inline a stream op
+        we don't go through the proxy executor, so that JSON entry is
+        dangling — the runner's loader validates the schema for every entry
+        and fails on ``streams::record_event`` unless the runner happens to
+        import the Python module that registers it. Pop the entry to keep
+        the JSON in sync with the actually-emitted code.
+        """
+        if self._emit_stream_op_inline(python_kernel_name, list(get_args())):
+            if V.extern_kernel_nodes:
+                V.extern_kernel_nodes.pop()
+            return
+        super().generate_fallback_kernel_with_runtime_lookup(
+            buf_name,
+            python_kernel_name,
+            get_args,
+            op_overload,
+            raw_args,
+            outputs,
+        )
 
     def get_autotuning_input_name(self, idx):
         return f"{self.autotune_input_prefix}_{idx}"
@@ -1220,11 +1581,21 @@ static struct TritonKernelCompileInit {{
                 original_fxnode_name=original_fxnode_name,
             )
 
-        stream = (
-            "stream"
-            if V.graph.aot_mode
-            else self.write_get_raw_stream(device.index, graph_name)
-        )
+        if V.graph.aot_mode:
+            # In multi-stream graphs, current_stream_idx routes the kernel to
+            # the right aux stream variable declared in the prologue. When idx
+            # is None or 0, fall back to the AOTI default `stream` parameter.
+            stream = (
+                get_stream_name(current_stream_idx)
+                if current_stream_idx is not None and current_stream_idx != 0
+                else "stream"
+            )
+            manifest_stream_idx = (
+                current_stream_idx if current_stream_idx is not None else 0
+            )
+        else:
+            stream = self.write_get_raw_stream(device.index, graph_name)
+            manifest_stream_idx = current_stream_idx
 
         if triton:
             call_args, arg_types = self.prepare_triton_wrapper_args(

@@ -166,32 +166,25 @@ class TestWrapperCodegenStreams(InductorTestCase):
 
 
 class TestStreamCodegen(InductorTestCase):
-    """End-to-end tests for stream code generation."""
+    """End-to-end tests for stream code generation.
+
+    `EnterCudaStreamContextLine.codegen` dispatches via
+    ``V.graph.wrapper_code.codegen_enter_cuda_stream_context`` so that cpp
+    wrappers can override the emission. The cpp-wrapper no-op behavior and
+    the Python-wrapper unindent behavior are exercised end-to-end by the
+    AOTI / compile suites below — there's no separate unit coverage here.
+    """
 
     def test_enter_cuda_stream_context_codegen(self):
-        """Test code generation for entering a CUDA stream context."""
+        """Python wrapper emits ``with torch.cuda.stream(...)`` block."""
+        from torch._inductor.codegen.wrapper import PythonWrapperCodegen
+
         code = IndentedBuffer()
         code.writeline("def call(args):")
         code.do_indent()
         code.do_indent()  # Simulate being inside device guard
-
-        line = EnterCudaStreamContextLine(stream_idx=1)
-        line.codegen(code)
-
-        generated = code.getvalue()
-        # Should have stream context
-        self.assertIn("with torch.cuda.stream(stream1)", generated)
-
-    def test_exit_cuda_stream_context_codegen(self):
-        """Test code generation for exiting a CUDA stream context."""
-        code = IndentedBuffer()
-        code.do_indent()
-
-        line = ExitCudaStreamContextLine()
-        line.codegen(code)
-
-        # The exit just unindents, verify no error
-        self.assertIsNotNone(code.getvalue())
+        PythonWrapperCodegen.codegen_enter_cuda_stream_context(None, code, 1)
+        self.assertIn("with torch.cuda.stream(stream1)", code.getvalue())
 
 
 @unittest.skipIf(not TEST_CUDA, "requires CUDA")
@@ -2382,6 +2375,377 @@ class TestStreamCudagraphInteraction(InductorTestCase):
         for _ in range(3):
             result = compiled_fn(x, y)
         self.assertEqual(result, expected)
+
+
+@unittest.skipIf(not TEST_CUDA, "requires CUDA")
+class TestAOTIUserStreams(InductorTestCase):
+    """End-to-end AOTInductor tests for user-stream models.
+
+    Exercises the cpp_wrapper multi-stream codegen path: per-thread TLS
+    stream/event caches, kernel calls threaded with an explicit stream
+    variable, and inline ``cudaXxx`` calls for ``torch.ops.streams.*`` ops.
+    """
+
+    def test_diagnostic_export_captures_stream_ops(self):
+        """``torch.export.export(strict=True)`` must capture
+        ``with torch.cuda.stream(s):`` and ``stream.record_event()`` and
+        lower them to ``torch.ops.streams.*`` FX nodes — otherwise AOTI
+        never sees them and the codegen path is unreachable.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                s = torch.cuda.Stream()
+                with torch.cuda.stream(s):
+                    a = x + 1
+                e = s.record_event()
+                e.wait()
+                return a * 2
+
+        model = Model().cuda()
+        inputs = (torch.randn(1024, device="cuda"),)
+        ep = torch.export.export(model, inputs, strict=True)
+
+        graph_str = str(ep.graph)
+        # If export captures stream ops, we'd see at least one of these names
+        # in the FX graph repr. If we see none, export is dropping them and
+        # AOTI multi-stream is gated on an upstream fix to export.
+        stream_ops_present = any(
+            op in graph_str
+            for op in (
+                "record_event",
+                "wait_event",
+            )
+        )
+        self.assertTrue(
+            stream_ops_present,
+            "torch.export.export(strict=True) did NOT capture stream ops. "
+            "This means the AOTI multi-stream path is currently unreachable "
+            "via the standard export+aoti_compile_and_package flow.",
+        )
+
+    def _compile_and_run(self, model, inputs):
+        """Compile via aoti_compile_and_package, run, return (result, code).
+
+        Wrapped in ``fresh_cache()`` so each test gets a clean Inductor
+        cache directory — without this, an earlier diagnostic / test run
+        can cache the compiled artifact and cause our codegen overrides to
+        be skipped on subsequent runs.
+        """
+        from torch._inductor.utils import fresh_cache, run_and_get_cpp_code
+
+        # strict=True invokes Dynamo, which imports
+        # torch/_dynamo/variables/streams.py and registers
+        # ``torch.ops.streams.*`` ops in ``_side_effectful_functions`` —
+        # without this, Inductor's DCE drops them as dead code (no users).
+        ep = torch.export.export(model, inputs, strict=True)
+
+        def _compile():
+            return torch._inductor.aoti_compile_and_package(ep)
+
+        launch_manifest = None
+        with fresh_cache():
+            package_path, code = run_and_get_cpp_code(_compile)
+            loaded = torch._inductor.aoti_load_package(package_path)
+            result = loaded(*inputs)
+        return result, code
+
+    def test_multistream_with_cudagraphs_raises_at_compile_time(self):
+        """``CppWrapperGpu._check_cudagraph_compatibility`` must raise
+        ``NotImplementedError`` when ``config.triton.cudagraphs`` is enabled.
+
+        Reachable today only when AOT compile sees ``triton.cudagraphs=True``;
+        JIT cpp_wrapper + multi-stream is unsupported and short-circuits before
+        the guard runs.
+
+        The method doesn't read ``self``; call as an unbound class method
+        so the test doesn't need a real graph/wrapper context to construct
+        a ``CppWrapperGpu`` instance.
+        """
+        from torch._inductor.codegen.cpp_wrapper_gpu import CppWrapperGpu
+
+        with inductor_config.patch({"triton.cudagraphs": True}):
+            with self.assertRaisesRegex(NotImplementedError, "cudagraph"):
+                CppWrapperGpu._check_cudagraph_compatibility(None)  # type: ignore[arg-type]
+
+    def test_multistream_no_cudagraphs_passes_check(self):
+        """Default config (no cudagraphs) must not trip the guard."""
+        from torch._inductor.codegen.cpp_wrapper_gpu import CppWrapperGpu
+
+        with inductor_config.patch({"triton.cudagraphs": False}):
+            CppWrapperGpu._check_cudagraph_compatibility(None)  # type: ignore[arg-type]
+
+    def test_aux_stream_basic_aoti(self):
+        """A side-stream model whose only cross-stream sync is record_event
+        on the side stream + wait_event on the default stream compiles,
+        runs, and matches eager."""
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                s = torch.cuda.Stream()
+                with torch.cuda.stream(s):
+                    a = x + 1
+                e = s.record_event()
+                e.wait()  # default stream waits for s
+                return a * 2
+
+        model = Model().cuda()
+        inputs = (torch.randn(1024, device="cuda"),)
+        expected = model(*inputs)
+
+        result, code = self._compile_and_run(model, inputs)
+
+        self.assertEqual(result, expected)
+        self.assertIn("AOTIPerThreadStreamCache", code)
+        self.assertIn("_aoti_aux_stream_cache.get", code)
+        self.assertIn("cudaEventRecord", code)
+        self.assertIn("cudaStreamWaitEvent", code)
+        self.assertNotIn("cudaStreamSynchronize", code)
+
+    def test_record_wait_event_aoti(self):
+        """record_event/wait_event compile to inline cudaEventRecord/WaitEvent."""
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                s1 = torch.cuda.Stream()
+                s2 = torch.cuda.Stream()
+                with torch.cuda.stream(s1):
+                    a = x + 1
+                e = s1.record_event()
+                s2.wait_event(e)
+                with torch.cuda.stream(s2):
+                    b = a * 2
+                # Make b visible on the default stream before returning.
+                e2 = s2.record_event()
+                e2.wait()
+                return b
+
+        model = Model().cuda()
+        inputs = (torch.randn(1024, device="cuda"),)
+        expected = model(*inputs)
+
+        result, code = self._compile_and_run(model, inputs)
+
+        self.assertEqual(result, expected)
+        self.assertIn("AOTIPerThreadEventCache", code)
+        self.assertIn("_aoti_event_cache.get", code)
+        self.assertIn("cudaEventRecord", code)
+        self.assertIn("cudaStreamWaitEvent", code)
+
+    def test_single_stream_aoti_unchanged(self):
+        """A single-stream model must NOT pick up any multi-stream codegen.
+
+        Regression guard: the helper structs and TLS caches are only emitted
+        when num_streams > 1. A plain single-stream artifact stays exactly
+        the way it was before this change.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                return x * 2 + 1
+
+        model = Model().cuda()
+        inputs = (torch.randn(1024, device="cuda"),)
+        expected = model(*inputs)
+
+        result, code = self._compile_and_run(model, inputs)
+
+        self.assertEqual(result, expected)
+        self.assertNotIn("AOTIPerThreadStreamCache", code)
+        self.assertNotIn("AOTIPerThreadEventCache", code)
+        self.assertNotIn("_aoti_aux_stream_cache", code)
+
+    def test_unsupported_sync_ops_raise_at_compile_time(self):
+        """``synchronize_stream``, ``synchronize_event``, ``synchronize_device``,
+        and ``wait_stream`` are intentionally not supported in AOTI
+        cpp_wrapper. Models using them must fail loudly at compile time,
+        not silently fall through to the proxy executor (which would fail
+        at runtime instead)."""
+
+        class SyncStreamModel(torch.nn.Module):
+            def forward(self, x):
+                s = torch.cuda.Stream()
+                with torch.cuda.stream(s):
+                    a = x + 1
+                s.synchronize()  # synchronize_stream
+                return a * 2
+
+        class WaitStreamModel(torch.nn.Module):
+            def forward(self, x):
+                s1 = torch.cuda.Stream()
+                s2 = torch.cuda.Stream()
+                with torch.cuda.stream(s1):
+                    a = x + 1
+                s2.wait_stream(s1)
+                with torch.cuda.stream(s2):
+                    b = a * 2
+                e = s2.record_event()
+                e.wait()
+                return b
+
+        class SyncDeviceModel(torch.nn.Module):
+            def forward(self, x):
+                s = torch.cuda.Stream()
+                with torch.cuda.stream(s):
+                    a = x + 1
+                torch.cuda.synchronize()  # synchronize_device
+                return a * 2
+
+        # Inductor wraps the NotImplementedError raised in codegen as an
+        # InductorError; assert on the wrapper's message text instead of
+        # the inner exception type.
+        from torch._inductor.exc import InductorError
+
+        for ModelCls, expected_op in (
+            (SyncStreamModel, "synchronize_stream"),
+            (WaitStreamModel, "wait_stream"),
+            (SyncDeviceModel, "synchronize_device"),
+        ):
+            model = ModelCls().cuda()
+            inputs = (torch.randn(1024, device="cuda"),)
+            ep = torch.export.export(model, inputs, strict=True)
+            with self.assertRaises(InductorError) as cm:
+                torch._inductor.aoti_compile_and_package(ep)
+            msg = str(cm.exception)
+            self.assertIn(expected_op, msg)
+            self.assertIn("not supported", msg)
+
+    def test_event_record_on_specific_stream_aoti(self):
+        """``event.record(stream)`` and ``event.wait(stream)`` with explicit
+        stream args compile and produce a correct cross-stream sync."""
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                s1 = torch.cuda.Stream()
+                s2 = torch.cuda.Stream()
+                event = torch.cuda.Event()
+                with torch.cuda.stream(s1):
+                    a = x * 2
+                    event.record(s1)
+                with torch.cuda.stream(s2):
+                    event.wait(s2)
+                    b = a + 1
+                # Make b visible on the default stream before returning.
+                final = s2.record_event()
+                final.wait()
+                return b
+
+        model = Model().cuda()
+        inputs = (torch.randn(1024, device="cuda"),)
+        expected = model(*inputs)
+
+        result, code = self._compile_and_run(model, inputs)
+
+        self.assertEqual(result, expected)
+        self.assertIn("cudaEventRecord", code)
+        self.assertIn("cudaStreamWaitEvent", code)
+
+    def test_data_dependency_across_streams_aoti(self):
+        """Default-stream producer feeding a side-stream consumer compiles
+        and runs. The implicit cross-stream data dep must not be dropped."""
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                s = torch.cuda.Stream()
+                a = x * 2  # default stream
+                with torch.cuda.stream(s):
+                    b = a + 1  # depends on default-stream a
+                e = s.record_event()
+                e.wait()  # default waits for s
+                return b
+
+        model = Model().cuda()
+        inputs = (torch.randn(1024, device="cuda"),)
+        expected = model(*inputs)
+
+        result, code = self._compile_and_run(model, inputs)
+
+        self.assertEqual(result, expected)
+        self.assertIn("_aoti_aux_stream_cache.get", code)
+        self.assertIn("cudaEventRecord", code)
+        self.assertIn("cudaStreamWaitEvent", code)
+
+    def test_no_buffer_reuse_across_streams_aoti(self):
+        """Buffer produced on one stream must not be reused in-place on
+        another in the AOTI artifact.
+
+        Without the stream-aware ReuseKey, MemoryPlanningState would put
+        both buffers in the same freelist and the s2 kernel could overwrite
+        the s1 buffer before the s1 consumer is done with it.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                s1 = torch.cuda.Stream()
+                s2 = torch.cuda.Stream()
+                with torch.cuda.stream(s1):
+                    a = x + 1
+                e = s1.record_event()
+                s2.wait_event(e)
+                with torch.cuda.stream(s2):
+                    b = a + 2
+                # Make b visible on the default stream before returning.
+                e2 = s2.record_event()
+                e2.wait()
+                return b
+
+        model = Model().cuda()
+        inputs = (torch.randn(1024, device="cuda"),)
+        expected = model(*inputs)
+
+        result, code = self._compile_and_run(model, inputs)
+
+        self.assertEqual(result, expected)
+        # The s2 kernel must allocate its own output buffer rather than
+        # reusing the s1 output. The cpp wrapper allocates buffers via
+        # ``aoti_torch_empty_strided``; with two cross-stream buffers we
+        # expect at least two distinct allocation calls.
+        self.assertGreaterEqual(
+            code.count("aoti_torch_empty_strided"),
+            2,
+            "Expected >=2 buffer allocations (one per stream), got fewer — "
+            "buffer reuse across streams may have regressed the design's "
+            "load-bearing invariant.",
+        )
+
+    def test_combo_kernel_count_multistream_aoti(self):
+        """Combo kernels must not group nodes on different streams in AOTI.
+
+        Without stream-aware combo gating, the two independent pointwise
+        ops on different streams would be merged into a single combo
+        kernel, breaking stream isolation."""
+
+        class Model(torch.nn.Module):
+            def forward(self, x, y, z, w):
+                s = torch.cuda.Stream()
+                event = torch.cuda.Event()
+                a = x + y  # default stream
+                event.record()
+                with torch.cuda.stream(s):
+                    event.wait()
+                    b = z + w  # side stream
+                # Make b visible on the default stream before returning.
+                final = s.record_event()
+                final.wait()
+                return a, b
+
+        model = Model().cuda()
+        inputs = tuple(torch.randn(1024, device="cuda") for _ in range(4))
+        expected = model(*inputs)
+
+        with inductor_config.patch({"combo_kernels": True}):
+            result, code = self._compile_and_run(model, inputs)
+
+        for r, e in zip(result, expected):
+            self.assertEqual(r, e)
+        kernel_launches = code.count("launchKernel(")
+        self.assertGreaterEqual(
+            kernel_launches,
+            2,
+            f"Expected >=2 launchKernel calls across streams, got "
+            f"{kernel_launches} — combo fusion may have crossed a "
+            "stream boundary.",
+        )
 
 
 instantiate_parametrized_tests(TestStreamUtils)
