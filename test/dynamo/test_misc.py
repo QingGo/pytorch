@@ -5020,6 +5020,38 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
 
         self.assertTrue(loc.x is x)
 
+    def test_setattr_wrong_args_raises(self):
+        # setattr() with wrong arg count should raise TypeError during tracing,
+        # not silently graph-break (a graph break would just defer the same
+        # failure to eager execution).
+        @torch.compile(backend="eager")
+        def fn(x):
+            setattr(x, "foo")
+            return x
+
+        with self.assertRaises(TypeError):
+            fn(torch.randn(4))
+
+    def test_setattr_unsupported_type_graph_breaks(self):
+        # setattr() on a type that Dynamo can't trace symbolically (e.g. a
+        # UserDefinedClassVariable, which isn't tracked by side effects) should
+        # produce a graph break so the call runs in eager, where it succeeds.
+        counters.clear()
+
+        class Holder:
+            pass
+
+        def fn(x):
+            setattr(Holder, "val", 1)
+            return x + 1
+
+        x = torch.randn(4)
+        cnts = CompileCounter()
+        opt_fn = torch.compile(fn, backend=cnts)
+        result = opt_fn(x)
+        self.assertEqual(result, x + 1)
+        self.assertEqual(len(counters["graph_break"]), 1)
+
     def test_user_defined_class_name(self):
         class MyClassFoo:
             pass

@@ -24,6 +24,7 @@ from .builtin import (
     GetAttrBuiltinVariable,
     IterBuiltinVariable,
     ListBuiltinVariable,
+    SetAttrBuiltinVariable,
 )
 from .constant import ConstantVariable
 from .ctx_manager import (
@@ -256,6 +257,7 @@ __all__ = [
     "RemovableHandleVariable",
     "RepeatIteratorVariable",
     "SDPAParamsVariable",
+    "SetAttrBuiltinVariable",
     "SkipFunctionVariable",
     "SliceVariable",
     "StringFormatVariable",
