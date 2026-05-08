@@ -314,14 +314,8 @@ def generic_repr(tx: "InstructionTranslator", obj: VariableTracker) -> VariableT
 
     https://github.com/python/cpython/blob/v3.13.3/Objects/object.c#L745-L778
 
-    Resolution order: constants -> tp_repr -> TypeError if the result is not str.
+    Resolution order: tp_repr -> TypeError if the result is not str.
     """
-    if obj.is_python_constant():
-        try:
-            return ConstantVariable.create(repr(obj.as_python_constant()))
-        except Exception as e:
-            raise_observed_exception(type(e), tx, args=list(e.args))
-
     obj_type = maybe_get_python_type(obj)
 
     if type_implements_tp_repr(obj_type):

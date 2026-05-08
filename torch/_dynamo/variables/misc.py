@@ -719,7 +719,7 @@ class ExceptionVariable(VariableTracker):
         return f"{self.python_type_name()}({args})"
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/exceptions.c
+        # ref: BaseException_repr in https://github.com/python/cpython/blob/3.13/Objects/exceptions.c#L135-L142
         return VariableTracker.build(tx, self.debug_repr())
 
 

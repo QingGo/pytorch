@@ -380,9 +380,6 @@ class BaseBuiltinVariable(VariableTracker):
                     return VariableTracker.build(
                         tx, type.__repr__(arg.as_python_constant())
                     )
-
-            from .object_protocol import generic_repr
-
             return generic_repr(tx, arg)
         return super().call_method(tx, name, args, kwargs)
 

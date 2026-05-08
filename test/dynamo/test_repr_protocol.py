@@ -240,6 +240,29 @@ class TpReprTests(TestCase):
             "[Tensor(shape=(4,), dtype=torch.float32)]",
         )
 
+    def test_list_repr_tracks_user_defined_object_mutations(self):
+        class Obj:
+            def __init__(self, val):
+                self.val = val
+
+            def __repr__(self):
+                return f"Obj({self.val})"
+
+        def fn(x, obj):
+            y = x + 1
+            s1 = repr([obj])
+            obj.val.append(0)
+            s2 = repr([obj])
+            return y, s1, s2
+
+        x = torch.randn(4)
+        eager_result = fn(x, Obj([1, 2]))
+        compiled_result = torch.compile(fn, backend="eager", fullgraph=True)(
+            x, Obj([1, 2])
+        )
+        self.assertEqual(eager_result[0], compiled_result[0])
+        self.assertEqual(eager_result[1:], compiled_result[1:])
+
     def test_dict_repr_with_tensor(self):
         def fn(x):
             return repr({"x": x})
@@ -285,18 +308,34 @@ class TpReprTests(TestCase):
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(x), compiled(x))
 
-    def test_defaultdict_repr_with_nonconstant_factory(self):
+    def test_defaultdict_repr_with_nested_function_factory_unsupported(self):
         def fn(x):
             def factory():
                 return x
 
             return repr(collections.defaultdict(factory, {"a": 1}))
 
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.Unsupported,
+            r"repr\(\) on nested function with non-constructible closure",
+        ):
+            torch.compile(fn, backend="eager", fullgraph=True)(torch.randn(4))
+
+    def test_defaultdict_repr_uses_factory_repr(self):
+        class Factory:
+            def __call__(self):
+                return 0
+
+            def __repr__(self):
+                return "Factory()"
+
+        def fn(x, factory):
+            return repr(collections.defaultdict(factory, {"a": 1}))
+
         x = torch.randn(4)
+        factory = Factory()
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
-        out = compiled(x)
-        self.assertIn("defaultdict(", out)
-        self.assertIn("{'a': 1}", out)
+        self.assertEqual(fn(x, factory), compiled(x, factory))
 
     def test_user_defined_dict_subclass_repr(self):
         class MyDict(dict):
@@ -309,6 +348,33 @@ class TpReprTests(TestCase):
         obj = MyDict({"a": 1})
         compiled = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(x, obj), compiled(x, obj))
+
+    def test_ordereddict_and_namedtuple_repr_track_nested_repr(self):
+        class Obj:
+            def __init__(self, val):
+                self.val = val
+
+            def __repr__(self):
+                return f"Obj({self.val})"
+
+        Named = collections.namedtuple("Named", ["obj"])
+
+        def fn(x, obj):
+            ordered = collections.OrderedDict([("obj", obj)])
+            named = Named(obj)
+            y = x + 1
+            s1 = (repr(ordered), repr(named))
+            obj.val.append(0)
+            s2 = (repr(ordered), repr(named))
+            return y, s1, s2
+
+        x = torch.randn(4)
+        eager_result = fn(x, Obj([1, 2]))
+        compiled_result = torch.compile(fn, backend="eager", fullgraph=True)(
+            x, Obj([1, 2])
+        )
+        self.assertEqual(eager_result[0], compiled_result[0])
+        self.assertEqual(eager_result[1:], compiled_result[1:])
 
     def test_structseq_repr(self):
         def fn(x):

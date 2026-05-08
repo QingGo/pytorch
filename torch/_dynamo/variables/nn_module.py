@@ -240,7 +240,7 @@ class NNModuleVariable(VariableTracker):
         return ConstantVariable.create(bool(mod))
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/object.c
+        # ref: slot_tp_repr in https://github.com/python/cpython/blob/3.13/Objects/typeobject.c#L10687-L10698
         mod = tx.output.get_submodule(self.module_key)
         return VariableTracker.build(tx, repr(mod))
 

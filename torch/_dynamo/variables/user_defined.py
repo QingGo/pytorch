@@ -88,6 +88,7 @@ from ..utils import (
     is_namedtuple_cls,
     is_pybind11_enum_member,
     is_torch_class,
+    is_wrapper_or_member_descriptor,
     istype,
     list_methods,
     namedtuple_fields,
@@ -158,10 +159,10 @@ if TYPE_CHECKING:
     from .lists import ListVariable, TupleVariable
 
 
-def _tracked_debug_repr(vt: VariableTracker) -> str:
-    if vt.is_python_constant():
-        return repr(vt.as_python_constant())
-    return vt.debug_repr()
+def _tracked_repr(tx: "InstructionTranslator", vt: VariableTracker) -> str:
+    from .object_protocol import generic_repr
+
+    return generic_repr(tx, vt).as_python_constant()
 
 
 def is_standard_setattr(val: object) -> bool:
@@ -453,7 +454,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
         return ConstantVariable.create(True)
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/typeobject.c
+        # https://github.com/python/cpython/blob/3.13/Objects/typeobject.c#L2379-L2408
         metaclass = type(self.value)
         if metaclass is type or type(self.value).__repr__ is type.__repr__:
             return VariableTracker.build(tx, repr(self.value))
@@ -1715,7 +1716,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         self,
         tx: "InstructionTranslator",
     ) -> VariableTracker:
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/typeobject.c
+        # ref: slot_tp_repr in https://github.com/python/cpython/blob/3.13/Objects/typeobject.c#L10687-L10698
         type_attr = self.lookup_class_mro_attr("__repr__")
         if type_attr is NO_SUCH_SUBOBJ:
             return super().repr_impl(tx)
@@ -1732,6 +1733,32 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
         if type(self.value).__repr__ is object.__repr__:
             return VariableTracker.build(tx, repr(self.value))
+
+        if (
+            isinstance(
+                type_attr,
+                (
+                    types.MethodDescriptorType,
+                    types.WrapperDescriptorType,
+                ),
+            )
+            or is_wrapper_or_member_descriptor(type_attr)
+            or torch._C._dynamo.utils.is_instancemethod(type_attr)  # type: ignore[attr-defined]
+            or is_cython_function(type_attr)
+        ):
+            try:
+                inspect.getattr_static(type(type_attr), "__get__")(
+                    type_attr, self.value, type(self.value)
+                )
+            except (AttributeError, TypeError) as e:
+                raise_observed_exception(type(e), tx, args=list(e.args))
+            unimplemented(
+                gb_type="untraceable user-defined __repr__",
+                context=f"Could not trace __repr__ override for {type(self.value).__name__}",
+                explanation="Dynamo could not safely trace this user-defined __repr__ override.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+                skip_frame=True,
+            )
 
         source = self.source and self.get_source_by_walking_mro(tx, "__repr__")
         method_var = self.resolve_type_attr(tx, "__repr__", type_attr, source)
@@ -3519,7 +3546,7 @@ class UserDefinedExceptionObjectVariable(UserDefinedObjectVariable):
         return self.exc_vt.debug_repr()
 
     def repr_impl(self, tx: "InstructionTranslator") -> "VariableTracker":
-        # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/exceptions.c
+        # ref: BaseException_repr in https://github.com/python/cpython/blob/3.13/Objects/exceptions.c#L135-L142
         if type(self.value).__repr__ is not BaseException.__repr__:
             return super().repr_impl(tx)
         return self.exc_vt.repr_impl(tx)
@@ -3781,19 +3808,40 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
             if not items:
                 return f"{type(self.value).__name__}()"
             contents = ", ".join(
-                f"{_tracked_debug_repr(key.vt)}: {_tracked_debug_repr(value)}"
-                for key, value in items
+                f"{key.vt.debug_repr()}: {value.debug_repr()}" for key, value in items
             )
             return f"{type(self.value).__name__}({{{contents}}})"
         return base_vt.debug_repr()
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        # https://github.com/python/cpython/blob/3.13/Lib/collections/__init__.py#L748-L757
         method = self._maybe_get_baseclass_method("__repr__")
-        if (
-            method in self._base_methods
-            or type(self.value).__repr__ is collections.Counter.__repr__
-        ):
-            return VariableTracker.build(tx, self.debug_repr())
+        if type(self.value).__repr__ is collections.Counter.__repr__:
+            if self._base_vt is None:
+                raise AssertionError("_base_vt must not be None for Counter repr")
+            base_vt = cast(ConstDictVariable, self._base_vt)
+            items = list(base_vt.items.items())
+            try:
+                items = sorted(
+                    items,
+                    key=lambda item: item[1].as_python_constant(),
+                    reverse=True,
+                )
+            except (NotImplementedError, TypeError):
+                pass
+            if not items:
+                return VariableTracker.build(tx, f"{type(self.value).__name__}()")
+            contents = ", ".join(
+                f"{_tracked_repr(tx, key.vt)}: {_tracked_repr(tx, value)}"
+                for key, value in items
+            )
+            return VariableTracker.build(
+                tx, f"{type(self.value).__name__}({{{contents}}})"
+            )
+        if method in self._base_methods:
+            if self._base_vt is None:
+                raise AssertionError("_base_vt must not be None for dict repr")
+            return self._base_vt.repr_impl(tx)
         return super().repr_impl(tx)
 
 
@@ -3841,20 +3889,43 @@ class OrderedDictVariable(UserDefinedDictVariable):
             raise AssertionError("_base_vt must not be None in as_python_constant")
         return collections.OrderedDict(self._base_vt.as_python_constant())
 
+    @staticmethod
+    def _ordered_dict_repr(items: Sequence[tuple[str, str]]) -> str:
+        if not items:
+            return "OrderedDict()"
+        if sys.version_info >= (3, 12):
+            return (
+                "OrderedDict({"
+                + ", ".join(f"{key}: {value}" for key, value in items)
+                + "})"
+            )
+        return (
+            "OrderedDict(["
+            + ", ".join(f"({key}, {value})" for key, value in items)
+            + "])"
+        )
+
     def debug_repr(self) -> str:
         if self._base_vt is None:
             raise AssertionError("_base_vt must not be None for OrderedDict repr")
         base_vt = cast(ConstDictVariable, self._base_vt)
-        if not base_vt.items:
-            return "OrderedDict()"
-        contents = ", ".join(
-            f"({_tracked_debug_repr(key.vt)}, {_tracked_debug_repr(value)})"
+        items = [
+            (key.vt.debug_repr(), value.debug_repr())
             for key, value in base_vt.items.items()
-        )
-        return f"OrderedDict([{contents}])"
+        ]
+        return self._ordered_dict_repr(items)
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        return VariableTracker.build(tx, self.debug_repr())
+        # Python < 3.12 uses the historical list-of-pairs form, while 3.12+
+        # uses dict-style formatting.
+        if self._base_vt is None:
+            raise AssertionError("_base_vt must not be None for OrderedDict repr")
+        base_vt = cast(ConstDictVariable, self._base_vt)
+        items = [
+            (_tracked_repr(tx, key.vt), _tracked_repr(tx, value))
+            for key, value in base_vt.items.items()
+        ]
+        return VariableTracker.build(tx, self._ordered_dict_repr(items))
 
     def nb_or_impl(
         self, tx: "InstructionTranslator", other: VariableTracker, reverse: bool = False
@@ -3977,14 +4048,9 @@ class DefaultDictVariable(UserDefinedDictVariable):
         raises TypeError if not.  We mirror this by checking the
         underlying Python value when possible.
         """
-        if isinstance(arg, variables.ConstantVariable):
-            return arg.value is None
-        # Check the real Python value for callable()
-        try:
-            val = arg.as_python_constant()
+        val = arg.get_real_python_backed_value()
+        if val is not NO_SUCH_SUBOBJ:
             return val is None or callable(val)
-        except Exception:
-            pass
         # Callables (functions, builtins, classes) are supported
         return isinstance(
             arg,
@@ -4025,9 +4091,14 @@ class DefaultDictVariable(UserDefinedDictVariable):
         )
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        if self.is_python_constant():
-            return VariableTracker.build(tx, repr(self.as_python_constant()))
-        return VariableTracker.build(tx, self.debug_repr())
+        # https://github.com/python/cpython/blob/3.13/Modules/_collectionsmodule.c#L2373-L2405
+        if self._base_vt is None:
+            raise AssertionError("_base_vt must not be None for defaultdict repr")
+        return VariableTracker.build(
+            tx,
+            f"defaultdict({_tracked_repr(tx, self.default_factory)}, "
+            f"{_tracked_repr(tx, self._base_vt)})",
+        )
 
     def var_getattr(
         self,
@@ -4554,6 +4625,14 @@ class NamedTupleVariable(UserDefinedTupleVariable):
         items = [x.as_proxy() for x in self.items]
         return self.tuple_cls(*items)  # type: ignore[arg-type]
 
+    def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
+        fields = namedtuple_fields(self.tuple_cls)
+        items = ", ".join(
+            f"{name}={_tracked_repr(tx, item)}"
+            for name, item in zip(fields, self.items)
+        )
+        return VariableTracker.build(tx, f"{self.tuple_cls.__name__}({items})")
+
 
 class StructSequenceVariable(UserDefinedTupleVariable):
     """Represents C-implemented PyStructSequence types (torch.return_types.*).
@@ -4591,13 +4670,20 @@ class StructSequenceVariable(UserDefinedTupleVariable):
     def debug_repr(self) -> str:
         fields = namedtuple_fields(self.tuple_cls)
         items = ", ".join(
-            f"{name}={_tracked_debug_repr(item)}"
-            for name, item in zip(fields, self.items)
+            f"{name}={item.debug_repr()}" for name, item in zip(fields, self.items)
         )
         return f"{self.tuple_cls.__module__}.{self.tuple_cls.__qualname__}({items})"
 
     def repr_impl(self, tx: "InstructionTranslator") -> VariableTracker:
-        return VariableTracker.build(tx, self.debug_repr())
+        fields = namedtuple_fields(self.tuple_cls)
+        items = ", ".join(
+            f"{name}={_tracked_repr(tx, item)}"
+            for name, item in zip(fields, self.items)
+        )
+        return VariableTracker.build(
+            tx,
+            f"{self.tuple_cls.__module__}.{self.tuple_cls.__qualname__}({items})",
+        )
 
 
 class MutableMappingVariable(UserDefinedObjectVariable):
