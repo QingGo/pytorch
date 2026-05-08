@@ -28,6 +28,7 @@ from .builtin import (
     ListBuiltinVariable,
     SetAttrBuiltinVariable,
     StrBuiltinVariable,
+    TypeBuiltinVariable,
 )
 from .constant import ConstantVariable
 from .ctx_manager import (
@@ -265,6 +266,7 @@ __all__ = [
     "SetAttrBuiltinVariable",
     "SkipFunctionVariable",
     "StrBuiltinVariable",
+    "TypeBuiltinVariable",
     "SliceVariable",
     "StringFormatVariable",
     "StructSequenceVariable",
