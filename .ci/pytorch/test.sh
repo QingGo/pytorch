@@ -1363,12 +1363,30 @@ test_inductor_set_cpu_affinity(){
   if [[ "$(uname -m)" == "aarch64" && $cores -gt 16 ]]; then
     cores=16
   fi
-  export OMP_NUM_THREADS=$cores
+  if [[ -n "${USE_ARC:-}" ]]; then
+    # On ARC k8s, use nproc/4 to match the global ARC fix (see top of file).
+    # OpenMP spin-waits at thread barriers cause severe slowdowns when thread
+    # count equals the cgroup CPU quota.
+    OMP_NUM_THREADS=$(( cpus / 4 ))
+    if [[ "$OMP_NUM_THREADS" -lt 4 ]]; then
+      OMP_NUM_THREADS=4
+    fi
+  else
+    OMP_NUM_THREADS=$cores
+  fi
+  export OMP_NUM_THREADS
 
   # Handle cgroups slice start and end CPU
   start_cpu=$(python -c 'import os; print(min(os.sched_getaffinity(0)))')
-  # Leaving one physical CPU for other tasks
-  end_cpu=$(($(python -c 'import os; print(max(os.sched_getaffinity(0)))') - thread_per_core))
+  if [[ -n "${USE_ARC:-}" ]]; then
+    # On ARC k8s, sched_getaffinity sees host CPUs (e.g. 96-191) rather than
+    # the container's cgroup slice (e.g. 12 CPUs). Use nproc (cgroup-aware) to
+    # size the taskset range so we only pin to CPUs the container actually owns.
+    end_cpu=$((start_cpu + cpus - 1))
+  else
+    # Leaving one physical CPU for other tasks
+    end_cpu=$(($(python -c 'import os; print(max(os.sched_getaffinity(0)))') - thread_per_core))
+  fi
   export TASKSET="taskset -c $start_cpu-$end_cpu"
 }
 
