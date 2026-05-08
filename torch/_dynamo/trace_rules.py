@@ -63,6 +63,7 @@ from .variables import (
     FunctionalCallVariable,
     FunctorchHigherOrderVariable,
     GetAttrBuiltinVariable,
+    HasAttrBuiltinVariable,
     InspectSignatureVariable,
     IterBuiltinVariable,
     ListBuiltinVariable,
@@ -4036,6 +4037,7 @@ Main entry point for looking up the trace rule (the Dynamo variable) for a given
 BUILTIN_CALLABLES = {
     dict: DictBuiltinVariable,
     getattr: GetAttrBuiltinVariable,
+    hasattr: HasAttrBuiltinVariable,
     iter: IterBuiltinVariable,
     list: ListBuiltinVariable,
     setattr: SetAttrBuiltinVariable,
