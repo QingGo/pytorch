@@ -124,6 +124,17 @@ CPU_BUILD_ENV: dict[str, str] = {
     "USE_CUDA": "0",
 }
 
+# XPU builds source the oneAPI environment and enable SYCL/MKL/XCCL.
+XPU_BUILD_ENV: dict[str, str] = {
+    "TH_BINARY_BUILD": "1",
+    "USE_CUDA": "0",
+    "USE_STATIC_MKL": "1",
+    "USE_ONEMKL": "1",
+    "USE_XCCL": "1",
+    "USE_MPI": "0",
+    "INSTALL_TEST": "0",
+}
+
 PLATFORM_TAGS: dict[str, str] = {
     "x86_64": "manylinux_2_28_x86_64",
     "aarch64": "manylinux_2_28_aarch64",
@@ -330,6 +341,37 @@ def cleanup_cuda_for_cpu_build() -> None:
             shutil.rmtree(entry, ignore_errors=True)
 
 
+def source_oneapi_env() -> None:
+    """Source Intel oneAPI environment scripts so SYCL/MKL/etc. are on PATH.
+
+    The vars.sh scripts set PATH, LD_LIBRARY_PATH, and various Intel-specific
+    variables. We spawn a shell, source them, then capture the resulting env.
+    """
+    scripts = [
+        "/opt/intel/oneapi/compiler/latest/env/vars.sh",
+        "/opt/intel/oneapi/pti/latest/env/vars.sh",
+        "/opt/intel/oneapi/umf/latest/env/vars.sh",
+        "/opt/intel/oneapi/ccl/latest/env/vars.sh",
+        "/opt/intel/oneapi/mpi/latest/env/vars.sh",
+    ]
+    existing = [s for s in scripts if Path(s).is_file()]
+    if not existing:
+        print("WARNING: No oneAPI env scripts found, skipping")
+        return
+    source_cmds = " && ".join(f"source {s}" for s in existing)
+    result = subprocess.run(
+        ["bash", "-c", f"{source_cmds} && env -0"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for entry in result.stdout.split("\0"):
+        if "=" in entry:
+            key, _, value = entry.partition("=")
+            os.environ[key] = value
+    print(f"Sourced {len(existing)} oneAPI env scripts")
+
+
 def write_env_exports(env: dict[str, str], path: Path | None) -> None:
     """Write `export KEY=VALUE` lines for the parent shell to source."""
     if path is None:
@@ -389,7 +431,11 @@ def main() -> None:
         cleanup_cuda_for_cpu_build()
         env_out.update(CPU_BUILD_ENV)
         print("CPU environment configured")
-    # ROCm and XPU use the legacy Docker-in-Docker workflow and skip this script.
+    elif gpu_arch_type == "xpu":
+        source_oneapi_env()
+        cleanup_cuda_for_cpu_build()
+        env_out.update(XPU_BUILD_ENV)
+        print("XPU environment configured")
 
     write_env_exports(env_out, args.env_out)
     print("before-all setup complete")
