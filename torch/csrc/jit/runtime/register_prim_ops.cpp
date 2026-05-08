@@ -1702,7 +1702,8 @@ static const std::vector<OperatorGeneratorArgs> stringOpGenArgs{
         TORCH_SELECTIVE_SCHEMA(
             "aten::strip(str self, str chars=' \\n\\t\\f\\v') -> str"),
         [](Stack& stack) {
-          std::string chars = pop(stack).toStringRef();
+          auto charsIValue = pop(stack);
+          const std::string& chars = charsIValue.toStringRef();
           std::string string = pop(stack).toStringRef();
           auto rindex = string.find_last_not_of(chars);
           if (rindex != std::string::npos) {
