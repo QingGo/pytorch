@@ -2898,6 +2898,10 @@ class InstructionTranslatorBase(
         if not self.check_if_exc_matches():
             self.jump(inst)
 
+    @break_graph_if_unsupported(
+        push=True,
+        msg_prefix="Encountered graph break when attempting to trace COMPARE_OP: a comparison operation, e.g. a == b",
+    )
     def COMPARE_OP(self, inst: Instruction) -> None:
         if inst.argval == "exception match":
             self.CHECK_EXC_MATCH(inst)
@@ -4081,12 +4085,8 @@ class InstructionTranslatorBase(
             raise AssertionError(
                 "expected inst.argval == 0 or inst.argval == 1 to be true"
             )
-        if inst.argval == 0:
-            new_argval = "is"
-        else:
-            new_argval = "is not"
-        new_inst = create_instruction("COMPARE_OP", argval=new_argval)
-        self.COMPARE_OP(new_inst)
+        argval = "is" if inst.argval == 0 else "is not"
+        self.push(compare_op_handlers[argval](self, self.popn(2), {}))
 
     def CONTAINS_OP(self, inst: Instruction) -> None:
         if not (inst.argval == 0 or inst.argval == 1):
