@@ -21,7 +21,6 @@ on:
         type: string
         default: '3.10'
 
-# 防止同一组合的并发构建
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.pytorch_version }}-${{ inputs.macos_version }}-${{ inputs.python_version }}
   cancel-in-progress: true
@@ -89,8 +88,27 @@ jobs:
         shell: bash -el {0}
         run: |
           conda install -y mkl mkl-include numpy ninja pyyaml setuptools cmake cffi typing_extensions future six requests dataclasses
-          brew install cmake ninja
+          brew install cmake ninja ccache
+          # 设置 ccache 最大缓存大小为 5 GB
+          ccache -M 5G
 
+      # 缓存 ccache 产物，让后续构建复用
+      - name: Cache ccache objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ccache
+          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-
+
+      - name: Restore ccache environment
+        run: |
+          mkdir -p ${{ github.workspace }}/ccache
+          echo "CCACHE_DIR=${{ github.workspace }}/ccache" >> $GITHUB_ENV
+          # 将 ccache 包装器放在 PATH 最前端，自动拦截所有编译器调用
+          echo "/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
+
+      # 修复关键脚本权限
       - name: Fix script permissions
         run: |
           chmod +x scripts/build_host_protoc.sh
@@ -101,6 +119,7 @@ jobs:
         run: |
           export MACOSX_DEPLOYMENT_TARGET=10.15
           export CMAKE_OSX_ARCHITECTURES=x86_64
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
           python setup.py bdist_wheel
 
       - name: Locate wheel file
