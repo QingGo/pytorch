@@ -1,0 +1,149 @@
+name: Build PyTorch for Intel Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      pytorch_version:
+        description: 'PyTorch version tag (e.g. v2.6.0)'
+        required: true
+        type: string
+        default: 'v2.6.0'
+      macos_version:
+        description: 'macOS runner version (15 or 26)'
+        required: true
+        type: choice
+        options:
+          - '15'
+          - '26'
+      python_version:
+        description: 'Python version (e.g. 3.10)'
+        required: true
+        type: string
+        default: '3.10'
+
+# 防止同一组合的并发构建
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.pytorch_version }}-${{ inputs.macos_version }}-${{ inputs.python_version }}
+  cancel-in-progress: true
+
+jobs:
+  # 检查是否已有该组合的 Release，避免重复编译
+  check-existing:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      tag_name: ${{ steps.vars.outputs.tag_name }}
+      wheel_name: ${{ steps.vars.outputs.wheel_name }}
+    steps:
+      - name: Set variables
+        id: vars
+        run: |
+          # 去掉版本号前的 'v' 用于 wheel 命名，例如 v2.6.0 -> 2.6.0
+          VER_NO_V="${PT_VER#v}"
+          # Python 版本处理：3.10 -> cp310
+          PY_ABI="cp${PY_VER//.}"
+
+          # macOS 部署目标统一设为 10.15，可确保向前兼容
+          MACOS_DEPLOY_TARGET="10.15"
+
+          # 构造 wheel 文件名（与 python setup.py bdist_wheel 输出一致）
+          WHEEL_NAME="torch-${VER_NO_V}-${PY_ABI}-${PY_ABI}-macosx_${MACOS_DEPLOY_TARGET}_x86_64.whl"
+
+          # 构造唯一 tag，例如 torch-2.6.0-macos15-py310
+          TAG_NAME="torch-${VER_NO_V}-macos${MACOS_VER}-py${PY_VER}"
+
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "wheel_name=${WHEEL_NAME}" >> $GITHUB_OUTPUT
+        env:
+          PT_VER: ${{ inputs.pytorch_version }}
+          PY_VER: ${{ inputs.python_version }}
+          MACOS_VER: ${{ inputs.macos_version }}
+
+      - name: Check if release asset already exists
+        id: check
+        run: |
+          # 尝试获取该 tag 的 release 中的资产名称列表
+          if ASSETS=$(gh release view "${{ steps.vars.outputs.tag_name }}" --json assets -q ".assets[].name" 2>/dev/null); then
+            if echo "$ASSETS" | grep -qF "${{ steps.vars.outputs.wheel_name }}"; then
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "Release with the same wheel already exists. Skipping build."
+            else
+              echo "skip=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "No existing release found for tag ${{ steps.vars.outputs.tag_name }}."
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # 实际编译（仅在需要时运行）
+  build:
+    needs: check-existing
+    if: needs.check-existing.outputs.skip == 'false'
+    runs-on: ${{ inputs.macos_version == '15' && 'macos-15-intel' || 'macos-26-intel' }}
+    timeout-minutes: 360  # 编译可能长达数小时
+    steps:
+      - name: Checkout PyTorch source code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pytorch_version }}
+          submodules: recursive
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: ${{ inputs.python_version }}
+          miniforge-version: latest
+          activate-environment: build
+
+      - name: Install build dependencies
+        shell: bash -el {0}
+        run: |
+          # 通过 conda 安装 MKL 和基本 Python 包
+          conda install -y mkl mkl-include numpy ninja pyyaml setuptools cmake cffi typing_extensions future six requests dataclasses
+          # brew 安装 cmake 和 ninja 有时更稳定（二选一）
+          brew install cmake ninja
+
+      - name: Build PyTorch wheel
+        shell: bash -el {0}
+        run: |
+          export MACOSX_DEPLOYMENT_TARGET=10.15
+          export CMAKE_OSX_ARCHITECTURES=x86_64
+          python setup.py bdist_wheel
+
+      - name: Locate wheel file
+        id: wheel
+        shell: bash
+        run: |
+          WHL=$(ls dist/*.whl | head -1)
+          echo "path=${WHL}" >> $GITHUB_OUTPUT
+          echo "name=$(basename ${WHL})" >> $GITHUB_OUTPUT
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytorch-intel-wheel
+          path: ${{ steps.wheel.outputs.path }}
+
+      - name: Create/Update Release and upload wheel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-existing.outputs.tag_name }}
+          name: "PyTorch ${{ inputs.pytorch_version }} • macOS ${{ inputs.macos_version }} • Python ${{ inputs.python_version }}"
+          body: |
+            **Community Build for Intel Mac**
+            - PyTorch version: `${{ inputs.pytorch_version }}`
+            - Built on: `macos-${{ inputs.macos_version }}-intel`
+            - Python: `${{ inputs.python_version }}`
+            - Wheel: `${{ steps.wheel.outputs.name }}`
+
+            Install with:
+            ```
+            pip install ${{ steps.wheel.outputs.name }}
+            ```
+          files: ${{ steps.wheel.outputs.path }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
