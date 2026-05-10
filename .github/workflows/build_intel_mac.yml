@@ -69,7 +69,7 @@ jobs:
     needs: check-existing
     if: needs.check-existing.outputs.skip == 'false'
     runs-on: ${{ inputs.macos_version == '15' && 'macos-15-intel' || 'macos-26-intel' }}
-    timeout-minutes: 720   # 放宽到12小时，但优化后大概率不会超
+    timeout-minutes: 720
     steps:
       - name: Checkout PyTorch source code
         uses: actions/checkout@v4
@@ -84,19 +84,23 @@ jobs:
           miniforge-version: latest
           activate-environment: build
 
-      - name: Install build dependencies
+      # 必须安装 MKL 和 OpenMP 运行时，delocate 打包时需要它们
+      - name: Install build & runtime dependencies
         shell: bash -el {0}
         run: |
-          conda install -y mkl mkl-include numpy ninja pyyaml setuptools cmake cffi typing_extensions future six requests dataclasses
+          conda install -y \
+            mkl mkl-include \
+            numpy ninja pyyaml setuptools cmake cffi \
+            typing_extensions future six requests dataclasses \
+            llvm-openmp
           brew install cmake ninja ccache
-          ccache -M 5G   # 限制缓存大小为5GB
+          ccache -M 5G
 
-      # 修复后的 ccache 缓存（注意 Key 去掉了 run_id）
       - name: Cache ccache objects
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-v1
+          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-v2
           restore-keys: |
             ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-
 
@@ -111,26 +115,33 @@ jobs:
           chmod +x scripts/build_host_protoc.sh
           find scripts -name "*.sh" -exec chmod +x {} \;
 
-      # 关键：只编译你真正需要的东西
-      - name: Build PyTorch wheel (CPU only, no tests)
+      - name: Build PyTorch wheel (CPU+MKL, no tests)
         shell: bash -el {0}
         run: |
           export MACOSX_DEPLOYMENT_TARGET=10.15
           export CMAKE_OSX_ARCHITECTURES=x86_64
           export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
-          # 禁用所有不必要的功能，只保留 CPU + MKL
+          # 明确使用 MKL，并关闭冗余组件
+          export USE_MKL=1
+          export BLAS=MKL
           export BUILD_TEST=0
           export USE_MPS=0
           export USE_METAL=0
           export USE_VULKAN=0
           export USE_NCCL=0
           export USE_DISTRIBUTED=0
-          export USE_CUDA=0      # 虽然没有 CUDA，但明确写出更安全
+          export USE_CUDA=0
 
           python setup.py bdist_wheel
 
-      # ... 后续 Locate、Upload、Release 步骤保持不变
+      # 关键步骤：打包外部动态库（MKL / OpenMP）到 wheel 中
+      - name: Bundle shared libraries with delocate
+        shell: bash -el {0}
+        run: |
+          python -m pip install delocate
+          # delocate-wheel 会自动分析依赖并将 .dylib 拷贝进 wheel
+          delocate-wheel -v dist/*.whl
 
       - name: Locate wheel file
         id: wheel
@@ -152,11 +163,13 @@ jobs:
           tag_name: ${{ needs.check-existing.outputs.tag_name }}
           name: "PyTorch ${{ inputs.pytorch_version }} • macOS ${{ inputs.macos_version }} • Python ${{ inputs.python_version }}"
           body: |
-            **Community Build for Intel Mac**
+            **Community Build for Intel Mac** (fully portable)
             - PyTorch version: `${{ inputs.pytorch_version }}`
             - Built on: `macos-${{ inputs.macos_version }}-intel`
             - Python: `${{ inputs.python_version }}`
             - Wheel: `${{ steps.wheel.outputs.name }}`
+
+            📦 **This wheel includes MKL & OpenMP – no extra installs needed.**
 
             Install with:
             ```
