@@ -84,15 +84,14 @@ jobs:
           miniforge-version: latest
           activate-environment: build
 
-      # 必须安装 MKL 和 OpenMP 运行时，delocate 打包时需要它们
+      # 安装依赖：MKL + Intel OpenMP（必须同时安装以保证兼容）
       - name: Install build & runtime dependencies
         shell: bash -el {0}
         run: |
           conda install -y \
-            mkl mkl-include \
+            mkl mkl-include intel-openmp \
             numpy ninja pyyaml setuptools cmake cffi \
-            typing_extensions future six requests dataclasses \
-            llvm-openmp
+            typing_extensions future six requests dataclasses
           brew install cmake ninja ccache
           ccache -M 5G
 
@@ -100,7 +99,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-v2
+          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-v3
           restore-keys: |
             ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-
 
@@ -122,7 +121,6 @@ jobs:
           export CMAKE_OSX_ARCHITECTURES=x86_64
           export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
-          # 明确使用 MKL，并关闭冗余组件
           export USE_MKL=1
           export BLAS=MKL
           export BUILD_TEST=0
@@ -135,12 +133,13 @@ jobs:
 
           python setup.py bdist_wheel
 
-      # 关键步骤：打包外部动态库（MKL / OpenMP）到 wheel 中
+      # 关键修复：设置库搜索路径，然后打包所有外部动态库
       - name: Bundle shared libraries with delocate
         shell: bash -el {0}
         run: |
           python -m pip install delocate
-          # delocate-wheel 会自动分析依赖并将 .dylib 拷贝进 wheel
+          # 把 conda 环境的 lib 目录（含 libiomp5.dylib）加入搜索路径
+          export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
           delocate-wheel -v dist/*.whl
 
       - name: Locate wheel file
@@ -169,7 +168,7 @@ jobs:
             - Python: `${{ inputs.python_version }}`
             - Wheel: `${{ steps.wheel.outputs.name }}`
 
-            📦 **This wheel includes MKL & OpenMP – no extra installs needed.**
+            📦 **This wheel includes MKL & Intel OpenMP – no extra installs needed.**
 
             Install with:
             ```
