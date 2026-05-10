@@ -69,7 +69,7 @@ jobs:
     needs: check-existing
     if: needs.check-existing.outputs.skip == 'false'
     runs-on: ${{ inputs.macos_version == '15' && 'macos-15-intel' || 'macos-26-intel' }}
-    timeout-minutes: 360
+    timeout-minutes: 720   # 放宽到12小时，但优化后大概率不会超
     steps:
       - name: Checkout PyTorch source code
         uses: actions/checkout@v4
@@ -89,15 +89,14 @@ jobs:
         run: |
           conda install -y mkl mkl-include numpy ninja pyyaml setuptools cmake cffi typing_extensions future six requests dataclasses
           brew install cmake ninja ccache
-          # 设置 ccache 最大缓存大小为 5 GB
-          ccache -M 5G
+          ccache -M 5G   # 限制缓存大小为5GB
 
-      # 缓存 ccache 产物，让后续构建复用
+      # 修复后的 ccache 缓存（注意 Key 去掉了 run_id）
       - name: Cache ccache objects
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-${{ github.run_id }}
+          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-v1
           restore-keys: |
             ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-
 
@@ -105,22 +104,33 @@ jobs:
         run: |
           mkdir -p ${{ github.workspace }}/ccache
           echo "CCACHE_DIR=${{ github.workspace }}/ccache" >> $GITHUB_ENV
-          # 将 ccache 包装器放在 PATH 最前端，自动拦截所有编译器调用
           echo "/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
 
-      # 修复关键脚本权限
       - name: Fix script permissions
         run: |
           chmod +x scripts/build_host_protoc.sh
           find scripts -name "*.sh" -exec chmod +x {} \;
 
-      - name: Build PyTorch wheel
+      # 关键：只编译你真正需要的东西
+      - name: Build PyTorch wheel (CPU only, no tests)
         shell: bash -el {0}
         run: |
           export MACOSX_DEPLOYMENT_TARGET=10.15
           export CMAKE_OSX_ARCHITECTURES=x86_64
           export CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+          # 禁用所有不必要的功能，只保留 CPU + MKL
+          export BUILD_TEST=0
+          export USE_MPS=0
+          export USE_METAL=0
+          export USE_VULKAN=0
+          export USE_NCCL=0
+          export USE_DISTRIBUTED=0
+          export USE_CUDA=0      # 虽然没有 CUDA，但明确写出更安全
+
           python setup.py bdist_wheel
+
+      # ... 后续 Locate、Upload、Release 步骤保持不变
 
       - name: Locate wheel file
         id: wheel
