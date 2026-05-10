@@ -84,14 +84,20 @@ jobs:
           miniforge-version: latest
           activate-environment: build
 
-      # 安装依赖：MKL + Intel OpenMP（必须同时安装以保证兼容）
+      # 步骤 1: 添加 defaults 频道并安装依赖
       - name: Install build & runtime dependencies
         shell: bash -el {0}
         run: |
+          # 添加 defaults 频道，并将优先级设为灵活模式，确保能找到 intel-openmp
+          conda config --append channels defaults
+          conda config --set channel_priority flexible
+          
+          # 安装依赖，包括来自 defaults 频道的 intel-openmp
           conda install -y \
             mkl mkl-include intel-openmp \
             numpy ninja pyyaml setuptools cmake cffi \
             typing_extensions future six requests dataclasses
+          
           brew install cmake ninja ccache
           ccache -M 5G
 
@@ -99,7 +105,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-v3
+          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-v4
           restore-keys: |
             ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-
 
@@ -133,12 +139,12 @@ jobs:
 
           python setup.py bdist_wheel
 
-      # 关键修复：设置库搜索路径，然后打包所有外部动态库
+      # 步骤 2: 打包动态库 (确保 delocate 能找到 libiomp5.dylib)
       - name: Bundle shared libraries with delocate
         shell: bash -el {0}
         run: |
           python -m pip install delocate
-          # 把 conda 环境的 lib 目录（含 libiomp5.dylib）加入搜索路径
+          # 将 conda 环境的 lib 目录加入搜索路径，确保 delocate 能找到 libiomp5.dylib
           export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
           delocate-wheel -v dist/*.whl
 
