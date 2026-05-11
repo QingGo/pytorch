@@ -123,7 +123,7 @@ jobs:
           export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
           export USE_MKL=0
-          export BLAS=Accelerate
+          export BLAS=vecLib
           export BUILD_TEST=0
           export USE_MPS=0
           export USE_METAL=0
