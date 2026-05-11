@@ -1549,6 +1549,77 @@ def main() -> None:
     if EMIT_BUILD_WARNING:
         print_box(build_update_message)
 
+def fix_omp_delocate():
+    """
+    修复 OpenMP 运行时库路径，防止 delocate 双重打包。
+    此函数修改 libtorch_cpu.dylib 中的 OpenMP 库引用，
+    并将其正确复制到 torch/lib 目录。
+    """
+    # 确定构建输出目录。在 bdist_wheel 过程中通常是 build/lib
+    build_base = os.environ.get('BUILD_DIR', 'build')
+    lib_dir = Path(build_base) / 'lib' / 'torch' / 'lib'
+
+    # 根据芯片架构确定正确的 OpenMP 库名
+    omp_lib_name = 'libiomp5.dylib'  # x86_64 架构
+
+    # 需要修复的核心库
+    libtorch_cpu = lib_dir / 'libtorch_cpu.dylib'
+    if not libtorch_cpu.exists():
+        print(f"Warning: {libtorch_cpu} not found, skipping OMP fix.")
+        return
+
+    # 1. 查找 libiomp5.dylib 的来源位置
+    # 通常位于 conda 环境的 lib 目录
+    conda_prefix = os.environ.get('CONDA_PREFIX')
+    if not conda_prefix:
+        print("Warning: CONDA_PREFIX not set. Trying default MKL location.")
+        conda_prefix = os.environ.get('HOME', '/usr')
+    
+    source_omp_lib = Path(conda_prefix) / 'lib' / omp_lib_name
+    if not source_omp_lib.exists():
+        # 尝试从 Homebrew 查找
+        brew_prefix = subprocess.run(['brew', '--prefix'], capture_output=True, text=True).stdout.strip()
+        source_omp_lib = Path(brew_prefix) / 'lib' / omp_lib_name
+    
+    if not source_omp_lib.exists():
+        print(f"Error: Could not find {omp_lib_name}. The build might fail.")
+        return
+
+    # 2. 手动复制 OpenMP 库到 torch/lib 目录
+    target_omp_lib = lib_dir / omp_lib_name
+    if not target_omp_lib.exists():
+        print(f"Copying {source_omp_lib} -> {target_omp_lib}")
+        shutil.copy2(source_omp_lib, target_omp_lib)
+
+    # 3. 关键步骤: 修改 libtorch_cpu.dylib 的 rpath 和 install_name
+    # 将内部的 `@rpath/libiomp5.dylib` 引用改为 `@loader_path/libiomp5.dylib`
+    # 并删除旧的 rpath，防止 delocate 重复分析
+    omp_rpath_path = f"@rpath/libiomp5.dylib"
+    omp_loader_path = f"@loader_path/libiomp5.dylib"
+    
+    # 获取当前文件的所有 rpath
+    rpath_output = subprocess.run(
+        ['otool', '-l', str(libtorch_cpu)],
+        capture_output=True,
+        text=True
+    ).stdout
+    
+    # 提取并删除所有旧的 rpath
+    for line in rpath_output.splitlines():
+        if line.strip().startswith('path '):
+            old_rpath = line.strip().split(' ', 1)[1].strip()
+            subprocess.run(
+                ['install_name_tool', '-delete_rpath', old_rpath, str(libtorch_cpu)],
+                check=False
+            )
+            print(f"Deleted rpath: {old_rpath}")
+    
+    print(f"Patching {libtorch_cpu}...")
+    subprocess.run(
+        ['install_name_tool', '-change', omp_rpath_path, omp_loader_path, str(libtorch_cpu)],
+        check=True
+    )
+    print("OpenMP rpath fix applied successfully.")
 
 if __name__ == "__main__":
     main()
