@@ -121,6 +121,10 @@ jobs:
           export MACOSX_DEPLOYMENT_TARGET=10.15
           export CMAKE_OSX_ARCHITECTURES=x86_64
           export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          
+          # 关键修复：让 CMake 找到 vecLib 头文件
+          export SDKROOT=$(xcrun --show-sdk-path)
+          export VECLIB_INCLUDE_DIR="$SDKROOT/System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Headers"
 
           export USE_MKL=0
           export BLAS=vecLib
