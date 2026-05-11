@@ -84,20 +84,14 @@ jobs:
           miniforge-version: latest
           activate-environment: build
 
-      # 步骤 1: 添加 defaults 频道并安装依赖
+      # 移除 intel-openmp，只保留 MKL 本身
       - name: Install build & runtime dependencies
         shell: bash -el {0}
         run: |
-          # 添加 defaults 频道，并将优先级设为灵活模式，确保能找到 intel-openmp
-          conda config --append channels defaults
-          conda config --set channel_priority flexible
-          
-          # 安装依赖，包括来自 defaults 频道的 intel-openmp
           conda install -y \
-            mkl mkl-include intel-openmp \
+            mkl mkl-include \
             numpy ninja pyyaml setuptools cmake cffi \
             typing_extensions future six requests dataclasses
-          
           brew install cmake ninja ccache
           ccache -M 5G
 
@@ -136,15 +130,63 @@ jobs:
           export USE_NCCL=0
           export USE_DISTRIBUTED=0
           export USE_CUDA=0
+          export BUILD_DIR=$PWD/build  # 传递构建目录
 
           python setup.py bdist_wheel
 
-      # 步骤 2: 打包动态库 (确保 delocate 能找到 libiomp5.dylib)
+      # 核心修复步骤：在 delocate 之前修复 OMP 路径
+      - name: Fix OpenMP paths for delocate
+        shell: bash -el {0}
+        run: |
+          python -c "
+          import os, shutil, subprocess
+          from pathlib import Path
+
+          # 此时 wheel 刚刚生成完成，构建产物在 build/lib 中
+          build_base = os.environ.get('BUILD_DIR', 'build')
+          lib_dir = Path(build_base) / 'lib' / 'torch' / 'lib'
+          libtorch_cpu = lib_dir / 'libtorch_cpu.dylib'
+
+          if not libtorch_cpu.exists():
+              print(f'Error: {libtorch_cpu} not found')
+              exit(1)
+
+          # 查找 OMP 库
+          omp_lib_name = 'libiomp5.dylib'
+          source_omp = Path(os.environ['CONDA_PREFIX']) / 'lib' / omp_lib_name
+          if not source_omp.exists():
+              # Fallback to brew
+              brew_prefix = subprocess.run(['brew', '--prefix'], capture_output=True, text=True).stdout.strip()
+              source_omp = Path(brew_prefix) / 'lib' / omp_lib_name
+          if not source_omp.exists():
+              print(f'Error: Could not find {omp_lib_name}')
+              exit(1)
+
+          # 复制并修改
+          target_omp = lib_dir / omp_lib_name
+          if not target_omp.exists():
+              shutil.copy2(source_omp, target_omp)
+              print(f'Copied {source_omp} -> {target_omp}')
+
+          omp_rpath_path = '@rpath/libiomp5.dylib'
+          omp_loader_path = '@loader_path/libiomp5.dylib'
+          
+          # 清理旧 rpath
+          output = subprocess.run(['otool', '-l', str(libtorch_cpu)], capture_output=True, text=True).stdout
+          for line in output.splitlines():
+              if line.strip().startswith('path '):
+                  old_rpath = line.strip().split(' ', 1)[1]
+                  subprocess.run(['install_name_tool', '-delete_rpath', old_rpath, str(libtorch_cpu)], check=False)
+          
+          # 更新库引用
+          subprocess.run(['install_name_tool', '-change', omp_rpath_path, omp_loader_path, str(libtorch_cpu)], check=True)
+          print('OpenMP path fix applied.')
+          "
+
       - name: Bundle shared libraries with delocate
         shell: bash -el {0}
         run: |
           python -m pip install delocate
-          # 将 conda 环境的 lib 目录加入搜索路径，确保 delocate 能找到 libiomp5.dylib
           export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
           delocate-wheel -v dist/*.whl
 
@@ -168,15 +210,13 @@ jobs:
           tag_name: ${{ needs.check-existing.outputs.tag_name }}
           name: "PyTorch ${{ inputs.pytorch_version }} • macOS ${{ inputs.macos_version }} • Python ${{ inputs.python_version }}"
           body: |
-            **Community Build for Intel Mac** (fully portable)
+            **Community Build for Intel Mac** (OpenMP conflict fixed)
             - PyTorch version: `${{ inputs.pytorch_version }}`
             - Built on: `macos-${{ inputs.macos_version }}-intel`
             - Python: `${{ inputs.python_version }}`
             - Wheel: `${{ steps.wheel.outputs.name }}`
 
-            📦 **This wheel includes MKL & Intel OpenMP – no extra installs needed.**
-
-            Install with:
+            ** Contains a fix for OMP: Error #15 **
             ```
             pip install ${{ steps.wheel.outputs.name }}
             ```
