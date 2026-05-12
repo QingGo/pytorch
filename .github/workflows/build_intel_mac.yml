@@ -98,7 +98,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-v4
+          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-vecLib-v4
           restore-keys: |
             ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-
 
@@ -135,29 +135,34 @@ jobs:
 
           python setup.py bdist_wheel
 
-      # ✅ 关键步骤 1：在 delocate 前统一 OpenMP 路径
+      # 关键步骤：修复 OpenMP 路径以彻底避免重复加载
       - name: Fix OpenMP paths to avoid duplicate bundling
         shell: bash -el {0}
         run: |
-          # 定义 wheel 内库文件目标目录
-          # （根据macOS版本，可能略有不同，此处为常见路径）
           TARGET_LIB_DIR="build/lib/torch/lib"
+          OMP_LIB_SOURCE="$CONDA_PREFIX/lib/libomp.dylib"
 
-          # 查找并复制单个 libomp.dylib 到目标目录
-          OMP_LIB_SOURCE=$(find $CONDA_PREFIX/lib /usr/local/lib /opt/homebrew/lib -name "libomp.dylib" 2>/dev/null | head -1)
-          if [ -z "$OMP_LIB_SOURCE" ]; then
-            echo "Error: Could not find libomp.dylib in conda or system paths."
+          # 1. 检查源文件是否存在
+          if [ ! -f "$OMP_LIB_SOURCE" ]; then
+            echo "Error: libomp.dylib not found at $OMP_LIB_SOURCE"
+            echo "Installed packages:"
+            conda list llvm-openmp
             exit 1
           fi
-          cp "$OMP_LIB_SOURCE" "$TARGET_LIB_DIR/"
 
-          # 修改所有需要 libomp 的库，将其引用统一为 @loader_path/libomp.dylib
+          # 2. 复制单一 libomp 到目标目录
+          cp "$OMP_LIB_SOURCE" "$TARGET_LIB_DIR/"
+          echo "Copied $OMP_LIB_SOURCE to $TARGET_LIB_DIR/"
+
+          # 3. 统一所有 PyTorch 核心库的 libomp 引用方式
           cd "$TARGET_LIB_DIR"
           for lib in libtorch_cpu.dylib libtorch_python.dylib libtorch.dylib libtorch_global_deps.dylib; do
             if [ -f "$lib" ]; then
-              # 检查并修复 libomp 引用
+              # 修改引用路径：从 @rpath 改为 @loader_path
               install_name_tool -change "@rpath/libomp.dylib" "@loader_path/libomp.dylib" "$lib" 2>/dev/null || true
               echo "Fixed libomp reference in $lib"
+            else
+              echo "Skipping $lib (not found)"
             fi
           done
           cd -
