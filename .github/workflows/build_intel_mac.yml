@@ -98,7 +98,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-vecLib-v4
+          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-vecLib-final
           restore-keys: |
             ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-
 
@@ -135,42 +135,7 @@ jobs:
 
           python setup.py bdist_wheel
 
-      - name: Fix OpenMP paths to avoid duplicate bundling
-        shell: bash -el {0}
-        run: |
-          # 动态查找 libtorch_cpu.dylib 所在的目录
-          TARGET_LIB_DIR=$(find build -name "libtorch_cpu.dylib" -type f 2>/dev/null | head -1 | xargs dirname)
-          if [ -z "$TARGET_LIB_DIR" ]; then
-            echo "Error: Could not find libtorch_cpu.dylib in build directory."
-            exit 1
-          fi
-          echo "Found target lib directory: $TARGET_LIB_DIR"
-
-          OMP_LIB_SOURCE="$CONDA_PREFIX/lib/libomp.dylib"
-
-          # 1. 检查源文件
-          if [ ! -f "$OMP_LIB_SOURCE" ]; then
-            echo "Error: libomp.dylib not found at $OMP_LIB_SOURCE"
-            conda list llvm-openmp
-            exit 1
-          fi
-
-          # 2. 复制
-          cp "$OMP_LIB_SOURCE" "$TARGET_LIB_DIR/"
-          echo "Copied $OMP_LIB_SOURCE to $TARGET_LIB_DIR/"
-
-          # 3. 统一引用
-          cd "$TARGET_LIB_DIR"
-          for lib in libtorch_cpu.dylib libtorch_python.dylib libtorch.dylib libtorch_global_deps.dylib; do
-            if [ -f "$lib" ]; then
-              install_name_tool -change "@rpath/libomp.dylib" "@loader_path/libomp.dylib" "$lib" 2>/dev/null || true
-              echo "Fixed libomp reference in $lib"
-            else
-              echo "Skipping $lib (not found)"
-            fi
-          done
-          cd -
-
+      # 只保留 delocate，不再手动复制 OMP
       - name: Bundle shared libraries with delocate
         shell: bash -el {0}
         run: |
@@ -205,7 +170,7 @@ jobs:
             - BLAS: Apple Accelerate (vecLib)
             - Wheel: `${{ steps.wheel.outputs.name }}`
 
-            ✅ **No MKL dependencies, fixed OMP conflict – just install and go.**
+            ✅ **No MKL dependencies, single OMP runtime – just install and go.**
             
             Install with:
             ```
