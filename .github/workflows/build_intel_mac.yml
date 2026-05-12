@@ -135,30 +135,34 @@ jobs:
 
           python setup.py bdist_wheel
 
-      # 关键步骤：修复 OpenMP 路径以彻底避免重复加载
       - name: Fix OpenMP paths to avoid duplicate bundling
         shell: bash -el {0}
         run: |
-          TARGET_LIB_DIR="build/lib/torch/lib"
+          # 动态查找 libtorch_cpu.dylib 所在的目录
+          TARGET_LIB_DIR=$(find build -name "libtorch_cpu.dylib" -type f 2>/dev/null | head -1 | xargs dirname)
+          if [ -z "$TARGET_LIB_DIR" ]; then
+            echo "Error: Could not find libtorch_cpu.dylib in build directory."
+            exit 1
+          fi
+          echo "Found target lib directory: $TARGET_LIB_DIR"
+
           OMP_LIB_SOURCE="$CONDA_PREFIX/lib/libomp.dylib"
 
-          # 1. 检查源文件是否存在
+          # 1. 检查源文件
           if [ ! -f "$OMP_LIB_SOURCE" ]; then
             echo "Error: libomp.dylib not found at $OMP_LIB_SOURCE"
-            echo "Installed packages:"
             conda list llvm-openmp
             exit 1
           fi
 
-          # 2. 复制单一 libomp 到目标目录
+          # 2. 复制
           cp "$OMP_LIB_SOURCE" "$TARGET_LIB_DIR/"
           echo "Copied $OMP_LIB_SOURCE to $TARGET_LIB_DIR/"
 
-          # 3. 统一所有 PyTorch 核心库的 libomp 引用方式
+          # 3. 统一引用
           cd "$TARGET_LIB_DIR"
           for lib in libtorch_cpu.dylib libtorch_python.dylib libtorch.dylib libtorch_global_deps.dylib; do
             if [ -f "$lib" ]; then
-              # 修改引用路径：从 @rpath 改为 @loader_path
               install_name_tool -change "@rpath/libomp.dylib" "@loader_path/libomp.dylib" "$lib" 2>/dev/null || true
               echo "Fixed libomp reference in $lib"
             else
