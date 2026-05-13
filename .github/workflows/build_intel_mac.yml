@@ -84,13 +84,14 @@ jobs:
           miniforge-version: latest
           activate-environment: build
 
-      - name: Install build dependencies
+      # 关键改变：用 pip 安装 Python 依赖，彻底避开 OpenBLAS
+      - name: Install build dependencies (no OpenBLAS, no OpenMP)
         shell: bash -el {0}
         run: |
-          conda install -y \
+          # 使用 pip 安装 Python 包，避免引入 Conda 的 OpenBLAS
+          python -m pip install \
             numpy ninja pyyaml setuptools cmake cffi \
-            typing_extensions future six requests dataclasses \
-            llvm-openmp
+            typing_extensions future six requests dataclasses
           brew install cmake ninja ccache
           ccache -M 5G
 
@@ -98,7 +99,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-vecLib-final
+          key: ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-noomp-nobl-v1
           restore-keys: |
             ${{ runner.os }}-ccache-${{ inputs.pytorch_version }}-${{ inputs.python_version }}-
 
@@ -113,7 +114,7 @@ jobs:
           chmod +x scripts/build_host_protoc.sh
           find scripts -name "*.sh" -exec chmod +x {} \;
 
-      - name: Build PyTorch wheel (CPU, Accelerate via vecLib, no tests)
+      - name: Build PyTorch wheel (CPU, Accelerate, NO OpenMP/OpenBLAS)
         shell: bash -el {0}
         run: |
           export MACOSX_DEPLOYMENT_TARGET=10.15
@@ -125,6 +126,8 @@ jobs:
 
           export USE_MKL=0
           export BLAS=vecLib
+          export USE_OPENMP=0          # 彻底关闭 OpenMP，避免链接 libomp
+          export USE_OPENBLAS=OFF      # 显式禁止 OpenBLAS
           export BUILD_TEST=0
           export USE_MPS=0
           export USE_METAL=0
@@ -135,12 +138,11 @@ jobs:
 
           python setup.py bdist_wheel
 
-      # 只保留 delocate，不再手动复制 OMP
       - name: Bundle shared libraries with delocate
         shell: bash -el {0}
         run: |
           python -m pip install delocate
-          export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
+          # 无需 DYLD_LIBRARY_PATH，因为不应该再有外部 OMP 库需要打包
           delocate-wheel -v dist/*.whl
 
       - name: Locate wheel file
@@ -163,15 +165,14 @@ jobs:
           tag_name: ${{ needs.check-existing.outputs.tag_name }}
           name: "PyTorch ${{ inputs.pytorch_version }} • Accelerate (vecLib) • macOS ${{ inputs.macos_version }} • Python ${{ inputs.python_version }}"
           body: |
-            **Community Build for Intel Mac (using Apple Accelerate / vecLib)**
+            **Community Build for Intel Mac (pure Apple Accelerate)**
             - PyTorch version: `${{ inputs.pytorch_version }}`
             - Built on: `macos-${{ inputs.macos_version }}-intel`
             - Python: `${{ inputs.python_version }}`
             - BLAS: Apple Accelerate (vecLib)
+            - **No OpenBLAS, no MKL, no OMP runtime** → no more OMP Error #15
             - Wheel: `${{ steps.wheel.outputs.name }}`
 
-            ✅ **No MKL dependencies, single OMP runtime – just install and go.**
-            
             Install with:
             ```
             pip install ${{ steps.wheel.outputs.name }}
